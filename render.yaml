@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: so2-settings-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: WEBHOOK_BASE
+        sync: false
+      - key: DB_PATH
+        value: /data/so2_settings.db
+    disk:
+      name: so2-settings-data
+      mountPath: /data
+      sizeGB: 1
