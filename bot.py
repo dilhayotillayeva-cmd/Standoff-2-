@@ -1,655 +1,1432 @@
-import os
-import asyncio
-import logging
-import sqlite3
-import secrets
-import string
-from datetime import datetime, timezone
-from typing import Optional
+"""
+STANDOFF 2 SETTINGS BOT
+=======================
+Telegram bot: Python 3.11, aiogram 3, aiohttp webhook.
+Ma'lumotlar: SQLite (DB_PATH) yoki PostgreSQL (DATABASE_URL) - db.py.
 
-from aiogram import Bot, Dispatcher, F
+Ishga tushirish:  python bot.py   (muhit o'zgaruvchilari uchun README.md ga qarang)
+"""
+import asyncio
+import hashlib
+import html
+import logging
+import os
+import re
+import sys
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from urllib.parse import quote
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("so2-settings")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip().rstrip("/")
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).split(",") if x.strip().isdigit()}
-PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_PATH = "/webhook"
-DB_PATH = os.getenv("DB_PATH", "/data/so2_settings.db")
-if not os.path.isdir(os.path.dirname(DB_PATH) or "."):
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-
-if not BOT_TOKEN:
-    log.warning("BOT_TOKEN environment variable is not set. Set it in Render Environment.")
-
-dp = Dispatcher()
-bot: Optional[Bot] = None
-
-MAIN_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📱 NASTROYKA"), KeyboardButton(text="👤 PROFIL")],
-        [KeyboardButton(text="🪙 TANGALAR"), KeyboardButton(text="👥 REFERAL")],
-        [KeyboardButton(text="💎 TARIF OLISH"), KeyboardButton(text="🎟 PROMOKOD")],
-        [KeyboardButton(text="🖥 PC NASTROYKALARI"), KeyboardButton(text="🆘 YORDAM")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Bo‘limni tanlang"
+from db import (
+    BRANDS,
+    GYRO_MODES,
+    PHONE_FIELDS,
+    SUPPORT_USERNAME,
+    TARIFF_ORDER,
+    TARIFFS,
+    BotError,
+    Database,
+    PromoNotFound,
 )
 
-def now_text():
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
+try:  # bir foydalanuvchining parallel update'lari FSM holatini buzmasligi uchun
+    from aiogram.fsm.storage.memory import SimpleEventIsolation
+except ImportError:  # pragma: no cover
+    SimpleEventIsolation = None
 
-def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+log = logging.getLogger("bot")
 
-def init_db():
-    with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
-            coins INTEGER NOT NULL DEFAULT 0, tariff TEXT NOT NULL DEFAULT 'PLAYER',
-            referred_by INTEGER, joined_at TEXT NOT NULL, last_promo_date TEXT
-        );
-        CREATE TABLE IF NOT EXISTS models(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL,
-            brand TEXT NOT NULL DEFAULT '', model_name TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1, UNIQUE(platform, brand, model_name)
-        );
-        CREATE TABLE IF NOT EXISTS settings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, model_id INTEGER NOT NULL,
-            sens TEXT DEFAULT '***', scope_sens TEXT DEFAULT '***',
-            gyro_mode TEXT DEFAULT '60Hz', sens2 TEXT DEFAULT '***',
-            scope_sens2 TEXT DEFAULT '***', accelerator TEXT DEFAULT '',
-            small_grip TEXT DEFAULT '', updated_at TEXT,
-            FOREIGN KEY(model_id) REFERENCES models(id) ON DELETE CASCADE,
-            UNIQUE(model_id)
-        );
-        CREATE TABLE IF NOT EXISTS pc_settings(
-            id INTEGER PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
-            active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS claims(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-            model_id INTEGER NOT NULL, created_at TEXT NOT NULL,
-            FOREIGN KEY(model_id) REFERENCES models(id)
-        );
-        CREATE TABLE IF NOT EXISTS promos(
-            code TEXT PRIMARY KEY, reward INTEGER NOT NULL DEFAULT 0,
-            uses_left INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS promo_uses(
-            user_id INTEGER NOT NULL, code TEXT NOT NULL, used_at TEXT NOT NULL,
-            PRIMARY KEY(user_id, code)
-        );
-        CREATE TABLE IF NOT EXISTS referrals(
-            inviter_id INTEGER NOT NULL, invited_id INTEGER NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS settings_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        """)
-        # Seed common models; admins can add any missing model from the admin panel.
-        seed = [
-            ("iphone", "", "iPhone 11"), ("iphone", "", "iPhone 11 Pro"), ("iphone", "", "iPhone 11 Pro Max"),
-            ("iphone", "", "iPhone 12"), ("iphone", "", "iPhone 12 Pro"), ("iphone", "", "iPhone 12 Pro Max"),
-            ("iphone", "", "iPhone 13"), ("iphone", "", "iPhone 13 Pro"), ("iphone", "", "iPhone 13 Pro Max"),
-            ("iphone", "", "iPhone 14"), ("iphone", "", "iPhone 14 Pro"), ("iphone", "", "iPhone 14 Pro Max"),
-            ("iphone", "", "iPhone 15"), ("iphone", "", "iPhone 15 Pro"), ("iphone", "", "iPhone 15 Pro Max"),
-            ("iphone", "", "iPhone 16"), ("iphone", "", "iPhone 16 Pro"), ("iphone", "", "iPhone 16 Pro Max"),
-            ("iphone", "", "iPhone 17"), ("iphone", "", "iPhone 17 Pro"), ("iphone", "", "iPhone 17 Pro Max"),
-            ("android", "Redmi", "Redmi Note 10S"), ("android", "Redmi", "Redmi Note 10"), 
-            ("android", "Redmi", "Redmi Note 11"), ("android", "Redmi", "Redmi Note 12"),
-            ("android", "Redmi", "Redmi Note 13"), ("android", "Redmi", "Redmi Note 14"),
-            ("android", "Redmi", "Redmi 12"), ("android", "Redmi", "Redmi 13"),
-            ("android", "Samsung", "Samsung Galaxy A15"), ("android", "Samsung", "Samsung Galaxy A25"),
-            ("android", "Samsung", "Samsung Galaxy A35"), ("android", "Samsung", "Samsung Galaxy A55"),
-            ("android", "Samsung", "Samsung Galaxy S23"), ("android", "Samsung", "Samsung Galaxy S24"),
-            ("android", "Samsung", "Samsung Galaxy S25"), ("android", "Honor", "Honor X7"),
-            ("android", "Honor", "Honor X8"), ("android", "Honor", "Honor X9"),
-            ("android", "Honor", "Honor X9b"), ("android", "Honor", "Honor 90"),
-            ("android", "Honor", "Honor 200"), ("android", "Honor", "Honor Magic6 Pro"),
-        ]
-        for platform, brand, name in seed:
-            c.execute("INSERT OR IGNORE INTO models(platform,brand,model_name) VALUES(?,?,?)", (platform, brand, name))
-        for row in c.execute("SELECT id FROM models").fetchall():
-            c.execute("INSERT OR IGNORE INTO settings(model_id,updated_at) VALUES(?,?)", (row["id"], now_text()))
-        for i in range(1, 11):
-            c.execute("INSERT OR IGNORE INTO pc_settings(id,title,content) VALUES(?,?,?)",
-                      (i, f"PC Nastroyka #{i}", "Bu nastroyka admin tomonidan to‘ldirilmagan. Admin paneldan qiymat kiriting."))
-        c.execute("INSERT OR IGNORE INTO settings_meta(key,value) VALUES('premium_contact','@lwox_org')")
 
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+# ============================================================================
+# SOZLAMALAR (muhit o'zgaruvchilari)
+# ============================================================================
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    admin_ids: frozenset
+    webhook_base: str
+    webhook_path: str
+    webhook_secret: str
+    database_url: str
+    db_path: str
+    port: int
+    player_bonus_on_start: bool
 
-def ensure_user(user):
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO users(user_id,username,full_name,joined_at) VALUES(?,?,?,?)",
-                  (user.id, user.username or "", user.full_name or "", now_text()))
-        c.execute("UPDATE users SET username=?,full_name=? WHERE user_id=?",
-                  (user.username or "", user.full_name or "", user.id))
 
-def get_user(uid):
-    with db() as c:
-        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+def load_settings() -> Settings:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", token):
+        sys.exit("XATO: BOT_TOKEN berilmagan yoki noto'g'ri formatda.")
 
-def set_tariff(uid, tariff):
-    with db() as c:
-        c.execute("UPDATE users SET tariff=? WHERE user_id=?", (tariff, uid))
-
-def add_coins(uid, amount):
-    with db() as c:
-        c.execute("UPDATE users SET coins=MAX(0, coins + ?) WHERE user_id=?", (amount, uid))
-
-def main_kb():
-    return MAIN_MENU
-
-def inline(rows):
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def model_keyboard(rows, prefix="model", back="platform"):
-    buttons = [[InlineKeyboardButton(text=r["model_name"], callback_data=f"{prefix}:{r['id']}")] for r in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=back)])
-    return inline(buttons)
-
-async def send_main(message: Message, text="🎮 SO2 SETTINGS BOT\nKerakli bo‘limni tanlang."):
-    await message.answer(text, reply_markup=main_kb())
-
-@dp.message(CommandStart())
-async def start(message: Message):
-    ensure_user(message.from_user)
-    # Referral deep link: /start ref_123456
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) > 1 and parts[1].startswith("ref_"):
-        try:
-            inviter = int(parts[1][4:])
-            if inviter != message.from_user.id:
-                with db() as c:
-                    exists = c.execute("SELECT 1 FROM referrals WHERE invited_id=?", (message.from_user.id,)).fetchone()
-                    inviter_exists = c.execute("SELECT 1 FROM users WHERE user_id=?", (inviter,)).fetchone()
-                    if not exists and inviter_exists:
-                        c.execute("INSERT INTO referrals(inviter_id,invited_id,created_at) VALUES(?,?,?)",
-                                  (inviter, message.from_user.id, now_text()))
-                        inviter_row = c.execute("SELECT tariff FROM users WHERE user_id=?", (inviter,)).fetchone()
-                        reward = 2 if inviter_row and inviter_row["tariff"] in ("PREMIUM", "KT CREATOR") else 1
-                        c.execute("UPDATE users SET coins=coins+? WHERE user_id=?", (reward, inviter))
-        except ValueError:
-            pass
-    await send_main(message, f"🎮 Assalomu alaykum, {message.from_user.full_name}!\n\n📱 Standoff 2 uchun qurilmangizga mos nastroykani tanlang.")
-
-@dp.message(F.text == "📱 NASTROYKA")
-async def settings_menu(message: Message):
-    await message.answer("📱 Qurilma turini tanlang:", reply_markup=inline([
-        [InlineKeyboardButton(text="🍎 iPhone", callback_data="platform:iphone")],
-        [InlineKeyboardButton(text="🤖 Android", callback_data="platform:android")],
-    ]))
-
-@dp.callback_query(F.data == "platform:iphone")
-async def iphone_list(call: CallbackQuery):
-    with db() as c:
-        rows = c.execute("SELECT * FROM models WHERE platform='iphone' AND active=1 ORDER BY model_name").fetchall()
-    await call.message.edit_text("🍎 iPhone modelini tanlang:", reply_markup=model_keyboard(rows, back="settings:home"))
-    await call.answer()
-
-@dp.callback_query(F.data == "platform:android")
-async def android_brands(call: CallbackQuery):
-    await call.message.edit_text("🤖 Android brendini tanlang:", reply_markup=inline([
-        [InlineKeyboardButton(text="🔴 Redmi", callback_data="brand:Redmi")],
-        [InlineKeyboardButton(text="🔵 Samsung", callback_data="brand:Samsung")],
-        [InlineKeyboardButton(text="🟢 Honor", callback_data="brand:Honor")],
-        [InlineKeyboardButton(text="🔎 Boshqa / barcha Android", callback_data="brand:all")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:home")],
-    ]))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("brand:"))
-async def brand_models(call: CallbackQuery):
-    brand = call.data.split(":",1)[1]
-    with db() as c:
-        if brand == "all":
-            rows = c.execute("SELECT * FROM models WHERE platform='android' AND active=1 ORDER BY brand,model_name").fetchall()
-        else:
-            rows = c.execute("SELECT * FROM models WHERE platform='android' AND brand=? AND active=1 ORDER BY model_name", (brand,)).fetchall()
-    if not rows:
-        await call.answer("Bu brend uchun model hali qo‘shilmagan.", show_alert=True)
-        return
-    await call.message.edit_text(f"📱 {brand} modelini tanlang:", reply_markup=model_keyboard(rows, back="platform:android"))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("model:"))
-async def deliver_settings(call: CallbackQuery):
-    model_id = int(call.data.split(":",1)[1])
-    user = get_user(call.from_user.id)
-    with db() as c:
-        row = c.execute("""SELECT m.model_name,s.* FROM models m JOIN settings s ON s.model_id=m.id
-                           WHERE m.id=? AND m.active=1""", (model_id,)).fetchone()
-    if not row:
-        await call.answer("Nastroyka topilmadi.", show_alert=True)
-        return
-    if user and user["tariff"] == "PLAYER" and not is_admin(call.from_user.id):
-        # Player can receive phone settings; PC settings are gated separately.
-        pass
-    with db() as c:
-        c.execute("INSERT INTO claims(user_id,model_id,created_at) VALUES(?,?,?)",
-                  (call.from_user.id, model_id, now_text()))
-    gyro = row["gyro_mode"] if row["gyro_mode"] in ("100Hz", "60Hz", "30Hz") else "60Hz"
-    lines = [
-        f"DEVICE: {row['model_name']}", "",
-        f"SENS: {row['sens'] or '***'}",
-        f"SCOPE SENS: {row['scope_sens'] or '***'}",
-        f"GYRO MODE: {gyro}",
-        f"SENS: {row['sens2'] or '***'}",
-        f"SCOPE SENS: {row['scope_sens2'] or '***'}",
-        f"OLINGAN VAQT: {now_text()}",
-        f"PROFIL ID: {call.from_user.id}",
-    ]
-    if user and user["tariff"] in ("PREMIUM", "KT CREATOR"):
-        if row["accelerator"]:
-            lines.insert(1, f"ACCELERATOR: {row['accelerator']}")
-        if row["small_grip"]:
-            lines.insert(2, f"KICHIK USHLAGICH: {row['small_grip']}")
-    await call.message.answer("🎯 STANDOFF 2 NASTROYKA\n\n" + "\n".join(lines))
-    await call.answer("Nastroyka yuborildi!")
-
-@dp.callback_query(F.data == "settings:home")
-async def settings_home(call: CallbackQuery):
-    await call.message.edit_text("📱 Qurilma turini tanlang:", reply_markup=inline([
-        [InlineKeyboardButton(text="🍎 iPhone", callback_data="platform:iphone")],
-        [InlineKeyboardButton(text="🤖 Android", callback_data="platform:android")],
-    ]))
-    await call.answer()
-
-@dp.message(F.text == "🖥 PC NASTROYKALARI")
-async def pc_menu(message: Message):
-    user = get_user(message.from_user.id)
-    if not user or user["tariff"] not in ("PREMIUM", "KT CREATOR") and not is_admin(message.from_user.id):
-        await message.answer("🔒 PC nastroykalari oddiy PLAYER tarifida mavjud emas. Tarif olish uchun @lwox_org ga murojaat qiling.")
-        return
-    with db() as c:
-        rows = c.execute("SELECT id,title FROM pc_settings WHERE active=1 ORDER BY id").fetchall()
-    await message.answer("🖥 PC uchun 10 ta nastroykadan birini tanlang:", reply_markup=inline(
-        [[InlineKeyboardButton(text=r["title"], callback_data=f"pc:{r['id']}")] for r in rows]
-    ))
-
-@dp.callback_query(F.data.startswith("pc:"))
-async def pc_deliver(call: CallbackQuery):
-    user = get_user(call.from_user.id)
-    if not user or user["tariff"] not in ("PREMIUM", "KT CREATOR") and not is_admin(call.from_user.id):
-        await call.answer("PC nastroykalari faqat PREMIUM yoki KT CREATOR tarifida!", show_alert=True)
-        return
-    pc_id = int(call.data.split(":",1)[1])
-    with db() as c:
-        row = c.execute("SELECT * FROM pc_settings WHERE id=? AND active=1", (pc_id,)).fetchone()
-    if not row:
-        await call.answer("Nastroyka topilmadi.", show_alert=True)
-        return
-    await call.message.answer(f"🖥 STANDOFF 2 — {row['title']}\n\n{row['content']}\n\nOLINGAN VAQT: {now_text()}\nPROFIL ID: {call.from_user.id}")
-    await call.answer()
-
-@dp.message(F.text == "👤 PROFIL")
-async def profile(message: Message):
-    u = get_user(message.from_user.id)
-    with db() as c:
-        claims = c.execute("SELECT COUNT(*) n FROM claims WHERE user_id=?", (message.from_user.id,)).fetchone()["n"]
-        refs = c.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=?", (message.from_user.id,)).fetchone()["n"]
-    await message.answer(
-        f"👤 PROFIL\n\n🆔 ID: {message.from_user.id}\n🎖 Tarif: {u['tariff']}\n🪙 Tangalar: {u['coins']}\n👥 Referallar: {refs}\n🎯 Olingan nastroykalar: {claims}",
-        reply_markup=inline([[InlineKeyboardButton(text="💎 Tarif olish", callback_data="tariff:info")]])
-    )
-
-@dp.message(F.text == "🪙 TANGALAR")
-async def coins(message: Message):
-    u = get_user(message.from_user.id)
-    await message.answer(f"🪙 Balansingiz: {u['coins']} tanga\n\nTangalarni referal orqali yig‘ishingiz mumkin.")
-
-@dp.message(F.text == "👥 REFERAL")
-async def referral(message: Message):
-    me = await bot.get_me()
-    u = get_user(message.from_user.id)
-    reward = 2 if u["tariff"] in ("PREMIUM", "KT CREATOR") else 1
-    link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
-    with db() as c:
-        n = c.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=?", (message.from_user.id,)).fetchone()["n"]
-    await message.answer(f"👥 REFERAL TIZIMI\n\nSizning havolangiz:\n{link}\n\nTaklif qilinganlar: {n}\nHar bir yangi referal uchun: {reward} tanga.\nReferal birinchi marta botga kirganda hisoblanadi.")
-
-@dp.message(F.text == "💎 TARIF OLISH")
-async def tariff_info(message: Message):
-    await message.answer("💎 TARIFLAR\n\n🟢 PLAYER — bepul, telefon nastroykalari.\n💎 PREMIUM — PC nastroykalari va qo‘shimcha sozlamalar.\n👑 KT CREATOR — admin tasdiqlaydigan kontentmeyker tarifi.\n\nTarif sotib olish uchun: @lwox_org",
-                         reply_markup=inline([[InlineKeyboardButton(text="📩 @lwox_org ga murojaat", url="https://t.me/lwox_org")]]))
-
-@dp.callback_query(F.data == "tariff:info")
-async def tariff_info_cb(call: CallbackQuery):
-    await call.message.answer("💎 Tarif sotib olish uchun @lwox_org ga murojaat qiling.")
-    await call.answer()
-
-@dp.message(F.text == "🎟 PROMOKOD")
-async def promo_start(message: Message):
-    await message.answer("🎟 Promokodni kiriting. Promokoddan kuniga 1 marta foydalanish mumkin.")
-    # use per-user FSM-free marker in DB meta
-    with db() as c:
-        c.execute("INSERT OR REPLACE INTO settings_meta(key,value) VALUES(?,?)", (f"await_promo_{message.from_user.id}", "1"))
-
-@dp.message(F.text == "🆘 YORDAM")
-async def help_message(message: Message):
-    await message.answer("🆘 Yordam kerakmi? Tarif va sozlamalar bo‘yicha @lwox_org ga yozing.")
-
-@dp.message(Command("admin"))
-async def admin_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer("🛠 ADMIN PANEL", reply_markup=inline([
-        [InlineKeyboardButton(text="🔎 Model qidirish / nastroyka", callback_data="adm:search")],
-        [InlineKeyboardButton(text="➕ Model qo‘shish", callback_data="adm:addmodel")],
-        [InlineKeyboardButton(text="🖥 PC 10 nastroyka", callback_data="adm:pc")],
-        [InlineKeyboardButton(text="👤 ID orqali tarif", callback_data="adm:tariff")],
-        [InlineKeyboardButton(text="🪙 ID orqali tanga", callback_data="adm:coins")],
-        [InlineKeyboardButton(text="🎟 Promokod yaratish", callback_data="adm:promo")],
-        [InlineKeyboardButton(text="📣 Xabar yuborish", callback_data="adm:broadcast")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm:stats")],
-    ]))
-
-# Admin text-input workflows are stored in settings_meta, so they survive restarts.
-def set_admin_state(uid, state):
-    with db() as c:
-        c.execute("INSERT OR REPLACE INTO settings_meta(key,value) VALUES(?,?)", (f"admin_state_{uid}", state))
-def get_admin_state(uid):
-    with db() as c:
-        r = c.execute("SELECT value FROM settings_meta WHERE key=?", (f"admin_state_{uid}",)).fetchone()
-        return r["value"] if r else ""
-def clear_admin_state(uid):
-    with db() as c:
-        c.execute("DELETE FROM settings_meta WHERE key=?", (f"admin_state_{uid}",))
-
-@dp.callback_query(F.data.startswith("adm:"))
-async def admin_actions(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Adminlar uchun.", show_alert=True)
-        return
-    action = call.data.split(":",1)[1]
-    if action.startswith("edit:"):
-        model_id = int(action.split(":", 1)[1])
-        with db() as c:
-            row = c.execute("SELECT model_name FROM models WHERE id=?", (model_id,)).fetchone()
-        if not row:
-            await call.answer("Model topilmadi.", show_alert=True)
-            return
-        set_admin_state(call.from_user.id, f"editsettings:{model_id}")
-        await call.message.answer(
-            f"✏️ {row['model_name']} nastroykasini quyidagi formatda yuboring:\n"
-            "SENS | SCOPE SENS | GYRO(100Hz/60Hz/30Hz) | SENS2 | SCOPE2 | ACCELERATOR | KICHIK USHLAGICH\n"
-            "Misol: 150 | 80 | 60Hz | 140 | 70 | 1.0 | 0.5"
-        )
-        await call.answer()
-        return
-    prompts = {
-        "search": "Model nomini yozing (masalan: Redmi Note 10S).",
-        "addmodel": "Modelni shu formatda yuboring: platforma | brend | model nomi\nMisol: android | Redmi | Redmi Note 10S Pro\niPhone uchun: iphone | | iPhone 18",
-        "tariff": "Foydalanuvchi ID va tarifni yuboring:\nID | PLAYER yoki PREMIUM yoki KT CREATOR",
-        "coins": "Foydalanuvchi ID va tanga miqdorini yuboring:\nID | miqdor (manfiy son ham mumkin)",
-        "promo": "Promokod yaratish: KOD | tanga | foydalanish_soni",
-        "broadcast": "Yuboriladigan xabar matnini yuboring.",
-        "pc": "PC nastroykasini o‘zgartirish uchun: raqam | sarlavha | matn\nMisol: 1 | PC Nastroyka #1 | Sens: ...",
-    }
-    if action == "stats":
-        with db() as c:
-            users = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-            prem = c.execute("SELECT COUNT(*) n FROM users WHERE tariff='PREMIUM'").fetchone()["n"]
-            creators = c.execute("SELECT COUNT(*) n FROM users WHERE tariff='KT CREATOR'").fetchone()["n"]
-            models = c.execute("SELECT COUNT(*) n FROM models WHERE active=1").fetchone()["n"]
-            claims = c.execute("SELECT COUNT(*) n FROM claims").fetchone()["n"]
-        await call.message.answer(f"📊 STATISTIKA\nFoydalanuvchilar: {users}\nPremium: {prem}\nKT Creator: {creators}\nModellar: {models}\nOlingan nastroykalar: {claims}")
-    else:
-        set_admin_state(call.from_user.id, action)
-        await call.message.answer(prompts.get(action, "Ma'lumot yuboring."))
-    await call.answer()
-
-@dp.message()
-async def catch_all(message: Message):
-    uid = message.from_user.id
-    # Promo code input
-    with db() as c:
-        waiting = c.execute("SELECT value FROM settings_meta WHERE key=?", (f"await_promo_{uid}",)).fetchone()
-    if waiting:
-        code = (message.text or "").strip().upper()
-        with db() as c:
-            u = c.execute("SELECT last_promo_date FROM users WHERE user_id=?", (uid,)).fetchone()
-            today = datetime.now().strftime("%Y-%m-%d")
-            if u and u["last_promo_date"] == today:
-                c.execute("DELETE FROM settings_meta WHERE key=?", (f"await_promo_{uid}",))
-                await message.answer("⏳ Promokod bugun ishlatildi. Ertaga qayta urinib ko‘ring.")
-                return
-            p = c.execute("SELECT * FROM promos WHERE code=? AND active=1 AND uses_left>0", (code,)).fetchone()
-            used = c.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (uid, code)).fetchone()
-            if p and not used:
-                c.execute("UPDATE users SET coins=coins+?,last_promo_date=? WHERE user_id=?", (p["reward"], today, uid))
-                c.execute("UPDATE promos SET uses_left=uses_left-1 WHERE code=?", (code,))
-                c.execute("INSERT INTO promo_uses(user_id,code,used_at) VALUES(?,?,?)", (uid, code, now_text()))
-                c.execute("DELETE FROM settings_meta WHERE key=?", (f"await_promo_{uid}",))
-                await message.answer(f"✅ Promokod qabul qilindi! +{p['reward']} tanga.")
-            else:
-                await message.answer("❌ Promokod noto‘g‘ri, tugagan yoki avval ishlatilgan. Qayta kiriting yoki /start bosing.")
-        return
-    state = get_admin_state(uid) if is_admin(uid) else ""
-    if state:
-        text = (message.text or "").strip()
-        try:
-            if state.startswith("editsettings:"):
-                model_id = int(state.split(":",1)[1])
-                parts = [p.strip() for p in text.split("|")]
-                if len(parts) != 7:
-                    await message.answer("7 ta qiymat kerak: SENS | SCOPE SENS | GYRO(100Hz/60Hz/30Hz) | SENS2 | SCOPE2 | ACCELERATOR | KICHIK USHLAGICH")
-                    return
-                sens, scope, gyro, sens2, scope2, accel, grip = parts
-                if gyro not in ("100Hz", "60Hz", "30Hz"):
-                    await message.answer("GYRO qiymati 100Hz, 60Hz yoki 30Hz bo‘lishi kerak.")
-                    return
-                with db() as c:
-                    c.execute("""UPDATE settings SET sens=?,scope_sens=?,gyro_mode=?,sens2=?,scope_sens2=?,
-                                 accelerator=?,small_grip=?,updated_at=? WHERE model_id=?""",
-                              (sens, scope, gyro, sens2, scope2, accel, grip, now_text(), model_id))
-                clear_admin_state(uid)
-                await message.answer("✅ Nastroyka saqlandi.")
-            elif state == "search":
-                with db() as c:
-                    rows = c.execute("SELECT * FROM models WHERE model_name LIKE ? ORDER BY model_name LIMIT 30", (f"%{text}%",)).fetchall()
-                if not rows:
-                    await message.answer("Model topilmadi. Uni ➕ Model qo‘shish orqali kiriting.")
-                else:
-                    for r in rows:
-                        await message.answer(f"🔎 {r['model_name']} (ID: {r['id']})", reply_markup=inline([
-                            [InlineKeyboardButton(text="✏️ Nastroykani tahrirlash", callback_data=f"adm:edit:{r['id']}")]
-                        ]))
-                clear_admin_state(uid)
-            elif state == "addmodel":
-                parts = [p.strip() for p in text.split("|")]
-                if len(parts) != 3 or parts[0].lower() not in ("iphone", "android"):
-                    await message.answer("Format xato. Misol: android | Redmi | Redmi Note 10S Pro")
-                    return
-                platform, brand, name = parts
-                with db() as c:
-                    c.execute("INSERT OR IGNORE INTO models(platform,brand,model_name) VALUES(?,?,?)", (platform.lower(), brand, name))
-                    r = c.execute("SELECT id FROM models WHERE platform=? AND brand=? AND model_name=?", (platform.lower(), brand, name)).fetchone()
-                    c.execute("INSERT OR IGNORE INTO settings(model_id,updated_at) VALUES(?,?)", (r["id"], now_text()))
-                clear_admin_state(uid)
-                await message.answer(f"✅ Model saqlandi: {name}")
-            elif state == "tariff":
-                parts = [p.strip() for p in text.split("|")]
-                if len(parts) != 2 or parts[1].upper() not in ("PLAYER", "PREMIUM", "KT CREATOR"):
-                    await message.answer("Format: ID | PLAYER yoki PREMIUM yoki KT CREATOR")
-                    return
-                target, tariff = int(parts[0]), parts[1].upper()
-                with db() as c:
-                    existing = c.execute("SELECT tariff FROM users WHERE user_id=?", (target,)).fetchone()
-                    if not existing:
-                        await message.answer("Bu ID botdan hali foydalanmagan.")
-                        return
-                    old_tariff = existing["tariff"]
-                    c.execute("UPDATE users SET tariff=? WHERE user_id=?", (tariff, target))
-                clear_admin_state(uid)
-                await message.answer(f"✅ {target} tarifi: {tariff}")
-                try:
-                    await bot.send_message(target, f"🎉 Sizning tarifingiz admin tomonidan {tariff} ga o‘zgartirildi.")
-                    if old_tariff != tariff and tariff == "PREMIUM":
-                        add_coins(target, 100)
-                        await bot.send_message(target, "🪙 Premium tarifi faollashdi: +100 tanga!")
-                    elif old_tariff != tariff and tariff == "PLAYER":
-                        add_coins(target, 10)
-                        await bot.send_message(target, "🪙 Player tarifi faollashdi: +10 tanga!")
-                except Exception:
-                    pass
-            elif state == "coins":
-                parts = [p.strip() for p in text.split("|")]
-                if len(parts) != 2:
-                    await message.answer("Format: ID | miqdor")
-                    return
-                target, amount = int(parts[0]), int(parts[1])
-                with db() as c:
-                    c.execute("UPDATE users SET coins=MAX(0,coins+?) WHERE user_id=?", (amount, target))
-                    exists = c.execute("SELECT changes() n").fetchone()["n"]
-                clear_admin_state(uid)
-                await message.answer(f"✅ Tanga balansi yangilandi. (O‘zgarish: {exists})")
-                try:
-                    await bot.send_message(target, f"🪙 Admin hisobingizni {amount:+d} tanga ga o‘zgartirdi.")
-                except Exception:
-                    pass
-            elif state == "promo":
-                parts = [p.strip() for p in text.split("|")]
-                if len(parts) != 3:
-                    await message.answer("Format: KOD | tanga | foydalanish_soni")
-                    return
-                code, reward, uses = parts[0].upper(), int(parts[1]), int(parts[2])
-                with db() as c:
-                    c.execute("INSERT OR REPLACE INTO promos(code,reward,uses_left,active) VALUES(?,?,?,1)", (code, reward, uses))
-                clear_admin_state(uid)
-                await message.answer(f"✅ Promokod yaratildi: {code} (+{reward} tanga, {uses} foydalanish)")
-            elif state == "broadcast":
-                clear_admin_state(uid)
-                with db() as c:
-                    ids = [r["user_id"] for r in c.execute("SELECT user_id FROM users").fetchall()]
-                ok = 0
-                for target in ids:
-                    try:
-                        await bot.send_message(target, text)
-                        ok += 1
-                    except Exception:
-                        pass
-                await message.answer(f"📣 Xabar yuborildi: {ok}/{len(ids)} foydalanuvchi.")
-            elif state == "pc":
-                parts = [p.strip() for p in text.split("|", 2)]
-                if len(parts) != 3:
-                    await message.answer("Format: raqam | sarlavha | matn")
-                    return
-                pcid, title, content = int(parts[0]), parts[1], parts[2]
-                if pcid < 1 or pcid > 10:
-                    await message.answer("Raqam 1 dan 10 gacha bo‘lishi kerak.")
-                    return
-                with db() as c:
-                    c.execute("UPDATE pc_settings SET title=?,content=? WHERE id=?", (title, content, pcid))
-                clear_admin_state(uid)
-                await message.answer(f"✅ PC nastroyka #{pcid} yangilandi.")
-        except Exception as e:
-            log.exception("Admin input error")
-            await message.answer(f"❌ Xatolik: {e}")
-        return
-    # Avoid responding to every random text.
-    await message.answer("Menyudan bo‘limni tanlang yoki /start bosing.", reply_markup=MAIN_MENU)
-
-@dp.callback_query(F.data.startswith("adm:edit:"))
-async def admin_edit_settings(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Adminlar uchun.", show_alert=True)
-        return
-    model_id = int(call.data.rsplit(":",1)[1])
-    with db() as c:
-        row = c.execute("SELECT m.model_name,s.* FROM models m JOIN settings s ON s.model_id=m.id WHERE m.id=?", (model_id,)).fetchone()
-    if not row:
-        await call.answer("Model topilmadi.", show_alert=True)
-        return
-    set_admin_state(call.from_user.id, f"editsettings:{model_id}")
-    await call.message.answer(
-        f"✏️ {row['model_name']} nastroykasini quyidagi formatda yuboring:\n"
-        "SENS | SCOPE SENS | GYRO(100Hz/60Hz/30Hz) | SENS2 | SCOPE2 | ACCELERATOR | KICHIK USHLAGICH\n"
-        "Misol: 150 | 80 | 60Hz | 140 | 70 | 1.0 | 0.5"
-    )
-    await call.answer()
-
-# Process model setting edit as a dedicated state before generic admin states.
-@dp.message(F.text)
-async def admin_edit_settings_text(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    state = get_admin_state(message.from_user.id)
-    if not state.startswith("editsettings:"):
-        return
     try:
-        model_id = int(state.split(":",1)[1])
-        parts = [p.strip() for p in (message.text or "").split("|")]
-        if len(parts) != 7:
-            await message.answer("7 ta qiymat kerak, ularni | bilan ajrating.")
-            return
-        sens, scope, gyro, sens2, scope2, accel, grip = parts
-        if gyro not in ("100Hz", "60Hz", "30Hz"):
-            await message.answer("GYRO qiymati 100Hz, 60Hz yoki 30Hz bo‘lishi kerak.")
-            return
-        with db() as c:
-            c.execute("""UPDATE settings SET sens=?,scope_sens=?,gyro_mode=?,sens2=?,scope_sens2=?,
-                         accelerator=?,small_grip=?,updated_at=? WHERE model_id=?""",
-                      (sens, scope, gyro, sens2, scope2, accel, grip, now_text(), model_id))
-        clear_admin_state(message.from_user.id)
-        await message.answer("✅ Nastroyka saqlandi.")
-    except Exception as e:
-        await message.answer(f"❌ Xatolik: {e}")
+        admin_ids = frozenset(int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if x)
+    except ValueError:
+        sys.exit("XATO: ADMIN_IDS faqat raqamlardan iborat bo'lishi kerak (vergul bilan ajrating).")
+    if not admin_ids:
+        sys.exit("XATO: ADMIN_IDS bo'sh. Kamida bitta admin Telegram ID kiriting.")
 
-async def on_startup(app):
-    if bot is None:
-        return
-    init_db()
-    await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"),
-                               BotCommand(command="admin", description="Admin panel")])
-    if WEBHOOK_BASE:
-        await bot.set_webhook(f"{WEBHOOK_BASE}{WEBHOOK_PATH}", drop_pending_updates=False)
-        log.info("Webhook set: %s%s", WEBHOOK_BASE, WEBHOOK_PATH)
+    base = (os.getenv("WEBHOOK_BASE") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if not base.startswith("https://"):
+        sys.exit("XATO: WEBHOOK_BASE berilmagan yoki https:// bilan boshlanmaydi "
+                 "(Telegram webhook uchun faqat HTTPS qabul qiladi).")
+
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    secret = os.getenv("WEBHOOK_SECRET", "").strip() or digest[:48]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
+        sys.exit("XATO: WEBHOOK_SECRET faqat A-Z a-z 0-9 _ - belgilaridan iborat bo'lishi kerak.")
+
+    try:
+        port = int(os.getenv("PORT", "8080"))
+    except ValueError:
+        sys.exit("XATO: PORT raqam bo'lishi kerak.")
+
+    return Settings(
+        bot_token=token,
+        admin_ids=admin_ids,
+        webhook_base=base,
+        webhook_path=f"/webhook/{digest[-24:]}",
+        webhook_secret=secret,
+        database_url=(os.getenv("DATABASE_URL") or "").strip(),
+        db_path=(os.getenv("DB_PATH") or "data/bot.db").strip(),
+        port=port,
+        player_bonus_on_start=os.getenv("PLAYER_BONUS_ON_START", "").strip().lower() in {"1", "true", "yes", "on"},
+    )
+
+
+# ============================================================================
+# YORDAMCHI FUNKSIYALAR
+# ============================================================================
+PER_PAGE_MODELS = 8
+PER_PAGE_TX = 10
+PROMO_RE = re.compile(r"[A-Z0-9_-]{3,32}")
+SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME}"
+
+
+def esc(value) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def parse_int(text, lo: int, hi: int):
+    t = (text or "").strip().replace(" ", "")
+    if not re.fullmatch(r"\d{1,18}", t, re.ASCII):
+        return None
+    v = int(t)
+    return v if lo <= v <= hi else None
+
+
+def parse_ref(arg):
+    """/start USER_ID  (yoki ref_USER_ID) -> int | None"""
+    a = (arg or "").strip()
+    if a.lower().startswith("ref_"):
+        a = a[4:]
+    return int(a) if re.fullmatch(r"\d{1,16}", a, re.ASCII) else None
+
+
+def tariff_info(name: str) -> dict:
+    return TARIFFS.get(name, TARIFFS["PLAYER"])
+
+
+def btn(text: str, data: str = None, url: str = None) -> InlineKeyboardButton:
+    if url:
+        return InlineKeyboardButton(text=text, url=url)
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def ikb(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows if r])
+
+
+def grid(buttons: list, per_row: int = 2) -> list:
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def pager(prefix: str, page: int, total: int, per_page: int) -> list:
+    pages = max(1, -(-total // per_page))
+    if pages <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(btn("◀️", f"{prefix}:{page - 1}"))
+    row.append(btn(f"{page + 1}/{pages}", "noop"))
+    if page < pages - 1:
+        row.append(btn("▶️", f"{prefix}:{page + 1}"))
+    return row
+
+
+def cb_parts(cb: CallbackQuery, n: int):
+    p = (cb.data or "").split(":")
+    return p if len(p) == n else None
+
+
+def to_int(s: str):
+    return int(s) if re.fullmatch(r"\d{1,18}", s or "", re.ASCII) else None
+
+
+async def show(event, text: str, kb: InlineKeyboardMarkup = None) -> None:
+    """Callback bo'lsa xabarni tahrirlaydi, oddiy xabar bo'lsa yangi xabar yuboradi."""
+    if isinstance(event, CallbackQuery):
+        msg = event.message
+        if isinstance(msg, Message):
+            try:
+                await msg.edit_text(text, reply_markup=kb)
+                return
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc):
+                    return
+                log.debug("edit_text bajarilmadi (%s), yangi xabar yuboriladi", exc)
+        await event.bot.send_message(event.from_user.id, text, reply_markup=kb)
     else:
-        log.warning("WEBHOOK_BASE not set; webhook was not registered.")
+        await event.answer(text, reply_markup=kb)
 
-async def on_shutdown(app):
-    if bot:
-        await bot.session.close()
 
-def create_app():
-    global bot
-    if not BOT_TOKEN:
-        # Still provide health endpoint; configure BOT_TOKEN in Render to activate bot.
-        application = web.Application()
-        async def health(_request):
-            return web.json_response({"status": "ok", "bot": "not_configured"})
-        application.router.add_get("/", health)
-        application.router.add_get("/health", health)
-        return application
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    init_db()
+async def safe_send(bot: Bot, chat_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(chat_id, text)
+        return True
+    except TelegramAPIError as exc:
+        log.info("Xabar yuborib bo'lmadi (%s): %s", chat_id, exc)
+        return False
+
+
+class FailLimiter:
+    """Xotirada: oynada ko'p noto'g'ri urinish bo'lsa (promokod terib ko'rish) vaqtincha to'xtatadi."""
+
+    def __init__(self, limit: int = 5, window: int = 600):
+        self.limit, self.window = limit, window
+        self.hits = defaultdict(deque)
+
+    def blocked_for(self, key) -> int:
+        now, q = time.monotonic(), self.hits[key]
+        while q and now - q[0] > self.window:
+            q.popleft()
+        if len(q) >= self.limit:
+            return int(self.window - (now - q[0])) + 1
+        return 0
+
+    def add(self, key) -> None:
+        self.hits[key].append(time.monotonic())
+
+
+PROMO_LIMITER = FailLimiter()
+
+
+# ============================================================================
+# MATNLAR VA MENYU
+# ============================================================================
+BTN_SETTINGS = "📱 NASTROYKA"
+BTN_PROFILE = "👤 PROFIL"
+BTN_COINS = "🪙 TANGALAR"
+BTN_REFERRAL = "👥 REFERAL"
+BTN_TARIFF = "💎 TARIF OLISH"
+BTN_PROMO = "🎟 PROMOKOD"
+BTN_PC = "🖥 PC NASTROYKALARI"
+BTN_HELP = "🆘 YORDAM"
+MENU_TEXTS = frozenset({BTN_SETTINGS, BTN_PROFILE, BTN_COINS, BTN_REFERRAL, BTN_TARIFF, BTN_PROMO, BTN_PC, BTN_HELP})
+
+TX_LABELS = {
+    "referral": "👥 Referal",
+    "bonus": "🎁 Tarif bonusi",
+    "promo": "🎟 Promokod",
+    "admin_add": "➕ Admin qo'shdi",
+    "admin_sub": "➖ Admin ayirdi",
+}
+
+WELCOME = (
+    "👋 Assalomu alaykum, <b>{name}</b>!\n\n"
+    "🎮 <b>STANDOFF 2 SETTINGS BOT</b> ga xush kelibsiz.\n\n"
+    "Bu yerda iPhone, Android va PC uchun sozlamalarni topasiz. "
+    "Kerakli bo'limni quyidagi menyudan tanlang 👇"
+)
+
+HELP_TEXT = (
+    "🆘 <b>YORDAM</b>\n\n"
+    "<b>Qanday foydalaniladi?</b>\n"
+    "1️⃣ <b>📱 NASTROYKA</b> - qurilmangizni (iPhone / Android / PC) va modelingizni tanlang.\n"
+    "2️⃣ <b>👥 REFERAL</b> - havolangizni do'stlaringizga yuboring; ular botga birinchi marta kirganda tanga olasiz.\n"
+    "3️⃣ <b>🎟 PROMOKOD</b> - promokodni kiriting (kuniga bitta promokod, har bir kod faqat bir marta).\n"
+    "4️⃣ <b>💎 TARIF OLISH</b> - PREMIUM yoki KT CREATOR olish tartibi.\n"
+    "5️⃣ <b>🖥 PC NASTROYKALARI</b> - faqat PREMIUM va KT CREATOR uchun.\n\n"
+    "Tarif to'lovi botda avtomatik emas: admin to'lovni qo'lda tasdiqlaydi.\n\n"
+    f"❓ Savol yoki muammo bo'lsa: @{SUPPORT_USERNAME}"
+)
+
+PC_LOCKED = (
+    "🔒 <b>PC sozlamalari yopiq</b>\n\n"
+    "Bu bo'lim faqat <b>PREMIUM</b> va <b>KT CREATOR</b> tarifi uchun.\n\n"
+    f"Tarif olish uchun @{SUPPORT_USERNAME} bilan bog'laning."
+)
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_SETTINGS, BTN_PROFILE],
+        [BTN_COINS, BTN_REFERRAL],
+        [BTN_TARIFF, BTN_PROMO],
+        [BTN_PC, BTN_HELP],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+    )
+
+
+def kb_contact() -> InlineKeyboardMarkup:
+    return ikb([btn(f"📩 @{SUPPORT_USERNAME} bilan bog'lanish", url=SUPPORT_URL)])
+
+
+def render_settings(model: dict, show_kt: bool, admin: bool = False) -> str:
+    """Telefon sozlamalari matni. KT CREATOR maydonlari faqat KT CREATOR (yoki admin) uchun."""
+    lines = [f"📱 <b>{esc(model['name'])}</b>"]
+    if admin:
+        lines[0] += f"  <i>({esc(BRANDS[model['brand']])})</i>"
+    lines.append("")
+    for col, label, kt_only in PHONE_FIELDS:
+        if kt_only and not show_kt:
+            continue
+        value = model.get(col)
+        tag = " (KT)" if (admin and kt_only) else ""
+        lines.append(f"<b>{label}{tag}:</b> {esc(value) if value else '—'}")
+    if not show_kt:
+        lines += ["", "ℹ️ <i>KT CREATOR tarifida qo'shimcha maydonlar (ACCELERATOR, KICHIK USHLAGICH) ko'rinadi.</i>"]
+    return "\n".join(lines)
+
+
+def models_kb(rows, total, page, item_prefix, pager_prefix, footer_rows) -> InlineKeyboardMarkup:
+    items = [btn(r["name"], f"{item_prefix}:{r['id']}") for r in rows]
+    return ikb(*grid(items, 2), pager(pager_prefix, page, total, PER_PAGE_MODELS), *footer_rows)
+
+
+# ============================================================================
+# FSM HOLATLARI VA FILTRLAR
+# ============================================================================
+class UserStates(StatesGroup):
+    promo = State()
+
+
+class AdminStates(StatesGroup):
+    user_id = State()
+    coin_amount = State()
+    model_name = State()
+    model_rename = State()
+    field_value = State()
+    pc_value = State()
+    promo_code = State()
+    promo_coins = State()
+    promo_max = State()
+    broadcast_msg = State()
+
+
+class PlainText(BaseFilter):
+    """Oddiy matn: buyruq ('/...') ham, menyu tugmasi matni ham emas."""
+
+    async def __call__(self, message: Message) -> bool:
+        t = message.text
+        return bool(t) and not t.startswith("/") and t not in MENU_TEXTS
+
+
+class AnyContent(BaseFilter):
+    """Xabar yuborish uchun: istalgan turdagi xabar (buyruq va menyu tugmalaridan tashqari)."""
+
+    async def __call__(self, message: Message) -> bool:
+        t = message.text or ""
+        return not t.startswith("/") and t not in MENU_TEXTS
+
+
+class IsAdmin(BaseFilter):
+    """Faqat ADMIN_IDS dagi foydalanuvchilar va faqat shaxsiy chatda."""
+
+    async def __call__(self, event: TelegramObject, settings: Settings) -> bool:
+        user = getattr(event, "from_user", None)
+        if user is None or user.id not in settings.admin_ids:
+            return False
+        msg = event if isinstance(event, Message) else getattr(event, "message", None)
+        return msg is None or msg.chat.type == "private"
+
+
+class TouchUser(BaseMiddleware):
+    """Har bir update'da foydalanuvchini bazada yaratadi/yangilaydi va handlerga `user`, `is_new` beradi."""
+
+    async def __call__(self, handler, event, data):
+        tg = data.get("event_from_user")
+        if tg is None or tg.is_bot:
+            return await handler(event, data)
+        user, created = await data["db"].touch_user(tg.id, tg.username, tg.first_name)
+        data["user"], data["is_new"] = user, created
+        return await handler(event, data)
+
+
+user_router = Router(name="user")
+user_router.message.middleware(TouchUser())
+user_router.callback_query.middleware(TouchUser())
+
+admin_router = Router(name="admin")
+admin_router.message.filter(IsAdmin())
+admin_router.callback_query.filter(IsAdmin())
+
+
+# ============================================================================
+# FOYDALANUVCHI QISMI
+# ============================================================================
+@user_router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
+                    db: Database, bot: Bot, user: dict, is_new: bool):
+    await state.clear()
+    referrer_id = parse_ref(command.args)
+    # Referal faqat YANGI foydalanuvchi uchun (is_new). Mavjud foydalanuvchi havolani bossa mukofot yo'q.
+    if is_new and referrer_id:
+        res = await db.apply_referral(user["tg_id"], referrer_id)
+        if res:
+            await safe_send(
+                bot, res["referrer_id"],
+                f"🎉 Havolangiz orqali yangi foydalanuvchi qo'shildi!\n"
+                f"🪙 +{res['reward']} tanga. Balans: <b>{res['balance']}</b>",
+            )
+    name = esc(message.from_user.first_name or "do'st")
+    await message.answer(WELCOME.format(name=name), reply_markup=main_menu())
+
+
+@user_router.message(Command("menu"))
+@user_router.message(Command("cancel"))
+async def cmd_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📋 Asosiy menyu", reply_markup=main_menu())
+
+
+@user_router.callback_query(F.data == "noop")
+async def cb_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+# ---------- NASTROYKA ----------
+def kb_settings_root() -> InlineKeyboardMarkup:
+    return ikb([btn("🍎 iPhone", "st:b:iphone:0"), btn("🤖 Android", "st:android")], [btn("🖥 PC", "st:pc")])
+
+
+SETTINGS_ROOT_TEXT = "📱 <b>NASTROYKA</b>\n\nQurilmangiz turini tanlang:"
+
+
+@user_router.message(F.text == BTN_SETTINGS)
+async def menu_settings(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(SETTINGS_ROOT_TEXT, reply_markup=kb_settings_root())
+
+
+@user_router.callback_query(F.data == "st:root")
+async def cb_settings_root(cb: CallbackQuery):
+    await show(cb, SETTINGS_ROOT_TEXT, kb_settings_root())
+    await cb.answer()
+
+
+@user_router.callback_query(F.data == "st:android")
+async def cb_android(cb: CallbackQuery):
+    brands = [btn(BRANDS[k], f"st:b:{k}:0") for k in ("redmi", "samsung", "honor")]
+    await show(cb, "🤖 <b>Android</b>\n\nBrendni tanlang:", ikb(brands, [btn("⬅️ Orqaga", "st:root")]))
+    await cb.answer()
+
+
+@user_router.callback_query(F.data.startswith("st:b:"))
+async def cb_brand_models(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 4)
+    page = to_int(p[3]) if p else None
+    if not p or p[2] not in BRANDS or page is None:
+        return await cb.answer("Tugma eskirgan. /start ni bosing.")
+    brand = p[2]
+    rows, total, page = await db.list_models(brand, page, PER_PAGE_MODELS)
+    back = "st:root" if brand == "iphone" else "st:android"
+    title = f"📱 <b>{esc(BRANDS[brand])}</b>\n\nModelingizni tanlang:" if rows else \
+        f"📱 <b>{esc(BRANDS[brand])}</b>\n\nHozircha modellar qo'shilmagan."
+    await show(cb, title, models_kb(rows, total, page, "st:m", f"st:b:{brand}", [[btn("⬅️ Orqaga", back)]]))
+    await cb.answer()
+
+
+@user_router.callback_query(F.data.startswith("st:m:"))
+async def cb_model(cb: CallbackQuery, db: Database, user: dict):
+    p = cb_parts(cb, 3)
+    model_id = to_int(p[2]) if p else None
+    model = await db.get_model(model_id) if model_id is not None else None
+    if model is None:
+        return await cb.answer("Model topilmadi (o'chirilgan bo'lishi mumkin).", show_alert=True)
+    text = render_settings(model, show_kt=tariff_info(user["tariff"])["kt"])
+    await show(cb, text, ikb([btn("⬅️ Modellar", f"st:b:{model['brand']}:0")]))
+    await cb.answer()
+
+
+# ---------- PC ----------
+async def send_pc_menu(event, db: Database, user: dict, with_back: bool) -> None:
+    if not tariff_info(user["tariff"])["pc"]:
+        await show(event, PC_LOCKED, kb_contact())
+        return
+    sections = await db.list_pc_sections()
+    rows = [[btn(f"{s['num']}. {s['title']}", f"st:pcs:{s['num']}")] for s in sections]
+    if with_back:
+        rows.append([btn("⬅️ Orqaga", "st:root")])
+    await show(event, "🖥 <b>PC NASTROYKALARI</b>\n\nBo'limni tanlang:", ikb(*rows))
+
+
+@user_router.message(F.text == BTN_PC)
+async def menu_pc(message: Message, state: FSMContext, db: Database, user: dict):
+    await state.clear()
+    await send_pc_menu(message, db, user, with_back=False)
+
+
+@user_router.callback_query(F.data == "st:pc")
+async def cb_pc(cb: CallbackQuery, db: Database, user: dict):
+    await send_pc_menu(cb, db, user, with_back=True)
+    await cb.answer()
+
+
+@user_router.callback_query(F.data == "st:pclist")
+async def cb_pc_list(cb: CallbackQuery, db: Database, user: dict):
+    await send_pc_menu(cb, db, user, with_back=False)
+    await cb.answer()
+
+
+@user_router.callback_query(F.data.startswith("st:pcs:"))
+async def cb_pc_section(cb: CallbackQuery, db: Database, user: dict):
+    if not tariff_info(user["tariff"])["pc"]:  # tarif tushirilgan bo'lsa eski tugma ishlamasin
+        await show(cb, PC_LOCKED, kb_contact())
+        return await cb.answer()
+    p = cb_parts(cb, 3)
+    num = to_int(p[2]) if p else None
+    sec = await db.get_pc_section(num) if num is not None else None
+    if sec is None:
+        return await cb.answer("Bo'lim topilmadi.", show_alert=True)
+    body = esc(sec["content"]) if sec["content"] else "<i>Hozircha ma'lumot kiritilmagan.</i>"
+    await show(cb, f"🖥 <b>{sec['num']}. {esc(sec['title'])}</b>\n\n{body}",
+               ikb([btn("⬅️ Bo'limlar", "st:pclist")]))
+    await cb.answer()
+
+
+# ---------- PROFIL ----------
+@user_router.message(F.text == BTN_PROFILE)
+async def menu_profile(message: Message, state: FSMContext, db: Database, user: dict):
+    await state.clear()
+    count, _earned = await db.referral_stats(user["tg_id"])
+    uname = f"@{esc(user['username'])}" if user["username"] else "—"
+    await message.answer(
+        "👤 <b>PROFIL</b>\n\n"
+        f"🆔 Telegram ID: <code>{user['tg_id']}</code>\n"
+        f"👤 Username: {uname}\n"
+        f"💎 Tarif: <b>{esc(user['tariff'])}</b>\n"
+        f"🪙 Balans: <b>{user['balance']}</b>\n"
+        f"👥 Referallar soni: <b>{count}</b>"
+    )
+
+
+# ---------- TANGALAR ----------
+async def send_coins(event, db: Database, user: dict, page: int) -> None:
+    rows, total, page = await db.list_transactions(user["tg_id"], page, PER_PAGE_TX)
+    lines = ["🪙 <b>TANGALAR</b>", "", f"Balans: <b>{user['balance']}</b> 🪙", "", "📜 <b>Tranzaksiyalar tarixi</b>"]
+    if not rows:
+        lines.append("<i>Hozircha tranzaksiya yo'q.</i>")
+    for r in rows:
+        sign = "+" if r["amount"] > 0 else ""
+        label = TX_LABELS.get(r["kind"], esc(r["kind"]))
+        lines.append(f"<b>{sign}{r['amount']}</b> 🪙 · {label} · <i>{esc(r['created_at'][:16])}</i>")
+    kb = ikb(pager("tx", page, total, PER_PAGE_TX))
+    await show(event, "\n".join(lines), kb if kb.inline_keyboard else None)
+
+
+@user_router.message(F.text == BTN_COINS)
+async def menu_coins(message: Message, state: FSMContext, db: Database, user: dict):
+    await state.clear()
+    await send_coins(message, db, user, 0)
+
+
+@user_router.callback_query(F.data.startswith("tx:"))
+async def cb_coins_page(cb: CallbackQuery, db: Database, user: dict):
+    p = cb_parts(cb, 2)
+    page = to_int(p[1]) if p else None
+    await send_coins(cb, db, user, page or 0)
+    await cb.answer()
+
+
+# ---------- REFERAL ----------
+@user_router.message(F.text == BTN_REFERRAL)
+async def menu_referral(message: Message, state: FSMContext, db: Database, user: dict, bot_username: str):
+    await state.clear()
+    count, earned = await db.referral_stats(user["tg_id"])
+    link = f"https://t.me/{bot_username}?start={user['tg_id']}"
+    reward = tariff_info(user["tariff"])["referral"]
+    share = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote("Standoff 2 sozlamalari boti 🎮", safe="")
+    await message.answer(
+        "👥 <b>REFERAL</b>\n\n"
+        "Sizning havolangiz:\n"
+        f"<code>{link}</code>\n\n"
+        f"💎 Tarifingiz: <b>{esc(user['tariff'])}</b> - har bir referal uchun <b>{reward} 🪙</b>\n"
+        f"👥 Taklif qilinganlar: <b>{count}</b>\n"
+        f"🪙 Referaldan topilgan: <b>{earned}</b>\n\n"
+        "<b>Qoidalar:</b>\n"
+        "• Mukofot faqat botga <b>birinchi marta</b> kirgan yangi foydalanuvchi uchun beriladi;\n"
+        "• o'zingizni taklif qilib bo'lmaydi;\n"
+        "• bitta foydalanuvchi uchun mukofot faqat bir marta beriladi.",
+        reply_markup=ikb([btn("📤 Do'stlarga ulashish", url=share)]),
+    )
+
+
+# ---------- TARIF OLISH ----------
+@user_router.message(F.text == BTN_TARIFF)
+async def menu_tariff(message: Message, state: FSMContext, user: dict):
+    await state.clear()
+    await message.answer(
+        "💎 <b>TARIFLAR</b>\n\n"
+        "🔹 <b>PLAYER</b>\n"
+        "• 📱 Telefon sozlamalari\n"
+        "• 👥 Har bir referal uchun 1 🪙\n"
+        "• 🎁 Faollashtirishda bir martalik 10 🪙 bonus\n\n"
+        "🔸 <b>PREMIUM</b>\n"
+        "• PLAYER imkoniyatlari + 🖥 PC sozlamalari\n"
+        "• 👥 Har bir referal uchun 2 🪙\n"
+        "• 🎁 Faollashtirishda bir martalik 100 🪙 bonus\n\n"
+        "👑 <b>KT CREATOR</b>\n"
+        "• PREMIUM imkoniyatlari\n"
+        "• 📱 Qo'shimcha telefon sozlamalari (ACCELERATOR, KICHIK USHLAGICH)\n"
+        "• 👥 Har bir referal uchun 2 🪙\n\n"
+        f"Joriy tarifingiz: <b>{esc(user['tariff'])}</b>\n\n"
+        f"📩 Tarif olish uchun @{SUPPORT_USERNAME} ga yozing va ID raqamingizni yuboring: <code>{user['tg_id']}</code>\n\n"
+        "⚠️ <b>To'lov botda avtomatik amalga oshmaydi.</b> Admin to'lovni qo'lda tekshiradi va "
+        "tasdiqlagach tarifingizni faollashtiradi.",
+        reply_markup=kb_contact(),
+    )
+
+
+# ---------- PROMOKOD ----------
+def kb_cancel_promo() -> InlineKeyboardMarkup:
+    return ikb([btn("❌ Bekor qilish", "pr:cancel")])
+
+
+@user_router.message(F.text == BTN_PROMO)
+async def menu_promo(message: Message, state: FSMContext):
+    await state.set_state(UserStates.promo)
+    await message.answer(
+        "🎟 <b>PROMOKOD</b>\n\nPromokodni yuboring.\n\n"
+        "<i>Kuniga faqat bitta promokod ishlatish mumkin; har bir kod bir foydalanuvchi uchun bir martalik.</i>",
+        reply_markup=kb_cancel_promo(),
+    )
+
+
+@user_router.callback_query(F.data == "pr:cancel")
+async def cb_promo_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(cb, "Bekor qilindi.")
+    await cb.answer()
+
+
+@user_router.message(UserStates.promo, PlainText())
+async def promo_submit(message: Message, state: FSMContext, db: Database, user: dict):
+    uid = user["tg_id"]
+    wait = PROMO_LIMITER.blocked_for(uid)
+    if wait:
+        return await message.answer(f"⏳ Juda ko'p noto'g'ri urinish. {wait // 60 + 1} daqiqadan keyin qayta urinib ko'ring.")
+    code = message.text.strip().upper()
+    if not PROMO_RE.fullmatch(code):
+        PROMO_LIMITER.add(uid)
+        return await message.answer("❌ Promokod formati noto'g'ri. Qayta yuboring yoki menyudan boshqa bo'limni tanlang.",
+                                    reply_markup=kb_cancel_promo())
+    try:
+        res = await db.redeem_promo(uid, code)
+    except PromoNotFound:
+        PROMO_LIMITER.add(uid)
+        return await message.answer("❌ Bunday promokod mavjud emas. Qayta yuboring yoki menyudan boshqa bo'limni tanlang.",
+                                    reply_markup=kb_cancel_promo())
+    except BotError as exc:
+        return await message.answer(f"⚠️ {esc(exc)}", reply_markup=kb_cancel_promo())
+    await state.clear()
+    await message.answer(f"✅ Promokod qabul qilindi!\n🪙 +{res['coins']} tanga. Balans: <b>{res['balance']}</b>")
+
+
+# ---------- YORDAM ----------
+@user_router.message(F.text == BTN_HELP)
+async def menu_help(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(HELP_TEXT, reply_markup=kb_contact())
+
+
+# ---------- noma'lum xabarlar (eng oxirida!) ----------
+@user_router.message()
+async def fallback_message(message: Message):
+    await message.answer("Kerakli bo'limni quyidagi menyudan tanlang 👇", reply_markup=main_menu())
+
+
+@user_router.callback_query()
+async def fallback_callback(cb: CallbackQuery):
+    await cb.answer("Bu tugma eskirgan. /start ni bosing.")
+
+
+# ============================================================================
+# ADMIN QISMI
+# ============================================================================
+ADMIN_HOME_TEXT = "🛠 <b>ADMIN PANEL</b>\n\nBo'limni tanlang:"
+BACK_ADMIN = btn("⬅️ Admin menyu", "ad:home")
+
+
+def kb_admin_home() -> InlineKeyboardMarkup:
+    items = [
+        btn("📊 Statistika", "ad:st"), btn("🔍 Foydalanuvchi", "ad:user"),
+        btn("📱 Modellar", "ad:mod"), btn("🖥 PC sozlamalari", "ad:pc"),
+        btn("🎟 Promokodlar", "ad:pr"), btn("📢 Xabar yuborish", "ad:bc"),
+    ]
+    return ikb(*grid(items, 2))
+
+
+async def ask(event, state: FSMContext, new_state, text: str, back: str = "ad:home", **data) -> None:
+    """Admindan matn kiritishni so'raydi (FSM)."""
+    await state.set_state(new_state)
+    if data:
+        await state.update_data(**data)
+    await show(event, text, ikb([btn("❌ Bekor qilish", back)]))
+
+
+@admin_router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(ADMIN_HOME_TEXT, reply_markup=kb_admin_home())
+
+
+@admin_router.callback_query(F.data == "ad:home")
+async def cb_admin_home(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(cb, ADMIN_HOME_TEXT, kb_admin_home())
+    await cb.answer()
+
+
+# ---------- statistika ----------
+@admin_router.callback_query(F.data == "ad:st")
+async def cb_admin_stats(cb: CallbackQuery, db: Database):
+    s = await db.stats()
+    tariffs = "\n".join(f"   • {esc(t)}: <b>{s['by_tariff'].get(t, 0)}</b>" for t in TARIFF_ORDER)
+    await show(
+        cb,
+        "📊 <b>STATISTIKA</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{s['total']}</b>\n"
+        f"🆕 Bugun: <b>{s['today']}</b> · 7 kunda: <b>{s['week']}</b>\n"
+        f"💎 Tariflar:\n{tariffs}\n"
+        f"🪙 Jami balanslar: <b>{s['coins']}</b>\n"
+        f"👥 Referallar: <b>{s['referrals']}</b>\n"
+        f"🎟 Promokodlar: <b>{s['promos']}</b>\n"
+        f"📱 Modellar: <b>{s['models']}</b>",
+        ikb([BACK_ADMIN]),
+    )
+    await cb.answer()
+
+
+# ---------- foydalanuvchini boshqarish ----------
+async def show_user_card(event, db: Database, uid: int) -> None:
+    user = await db.get_user(uid)
+    if user is None:
+        return await show(event, "❌ Foydalanuvchi topilmadi.", ikb([BACK_ADMIN]))
+    count, earned = await db.referral_stats(uid)
+    uname = f"@{esc(user['username'])}" if user["username"] else "—"
+    text = (
+        "👤 <b>Foydalanuvchi</b>\n\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"👤 Username: {uname}\n"
+        f"📛 Ism: {esc(user['first_name'] or '—')}\n"
+        f"💎 Tarif: <b>{esc(user['tariff'])}</b>\n"
+        f"🪙 Balans: <b>{user['balance']}</b>\n"
+        f"👥 Referallar: <b>{count}</b> (topgan: {earned} 🪙)\n"
+        f"🔗 Kim taklif qilgan: {user['referrer_id'] or '—'}\n"
+        f"📅 Ro'yxatdan o'tgan: {esc(user['created_at'])}"
+    )
+    kb = ikb(
+        [btn("➕ Tanga qo'shish", f"ad:coin:add:{uid}"), btn("➖ Tanga ayirish", f"ad:coin:sub:{uid}")],
+        [btn("🎫 Tarifni o'zgartirish", f"ad:tar:{uid}")],
+        [BACK_ADMIN],
+    )
+    await show(event, text, kb)
+
+
+@admin_router.callback_query(F.data == "ad:user")
+async def cb_admin_user(cb: CallbackQuery, state: FSMContext):
+    await ask(cb, state, AdminStates.user_id, "🔍 Foydalanuvchining Telegram ID raqamini yuboring:")
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.user_id, PlainText())
+async def admin_user_id(message: Message, state: FSMContext, db: Database):
+    uid = parse_int(message.text, 1, 10 ** 16)
+    if uid is None:
+        return await message.answer("❗ Faqat raqam (Telegram ID) yuboring.")
+    if await db.get_user(uid) is None:
+        return await message.answer("❌ Bunday ID bazada yo'q (foydalanuvchi botga hali kirmagan). Boshqa ID yuboring.")
+    await state.clear()
+    await show_user_card(message, db, uid)
+
+
+@admin_router.callback_query(F.data.startswith("ad:u:"))
+async def cb_admin_user_card(cb: CallbackQuery, state: FSMContext, db: Database):
+    p = cb_parts(cb, 3)
+    uid = to_int(p[2]) if p else None
+    if uid is None:
+        return await cb.answer("Eskirgan tugma.")
+    await state.clear()
+    await show_user_card(cb, db, uid)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:coin:"))
+async def cb_admin_coin(cb: CallbackQuery, state: FSMContext):
+    p = cb_parts(cb, 4)
+    uid = to_int(p[3]) if p else None
+    if uid is None or p[2] not in ("add", "sub"):
+        return await cb.answer("Eskirgan tugma.")
+    word = "qo'shish" if p[2] == "add" else "ayirish"
+    await ask(cb, state, AdminStates.coin_amount,
+              f"🪙 Foydalanuvchi <code>{uid}</code> balansidan <b>{word}</b> uchun tanga miqdorini yuboring (butun son):",
+              back=f"ad:u:{uid}", uid=uid, mode=p[2])
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.coin_amount, PlainText())
+async def admin_coin_amount(message: Message, state: FSMContext, db: Database, bot: Bot):
+    amount = parse_int(message.text, 1, 1_000_000)
+    if amount is None:
+        return await message.answer("❗ 1 dan 1 000 000 gacha butun son yuboring.")
+    data = await state.get_data()
+    uid, mode = data.get("uid"), data.get("mode")
+    if uid is None or mode not in ("add", "sub"):
+        await state.clear()
+        return await message.answer("Eskirgan so'rov. /admin ni bosing.")
+    signed = amount if mode == "add" else -amount
+    try:
+        balance = await db.adjust_coins(uid, signed, message.from_user.id)
+    except BotError as exc:
+        return await message.answer(f"❌ {esc(exc)}\nBoshqa miqdor yuboring yoki bekor qiling.")
+    await state.clear()
+    await db.audit(message.from_user.id, "coins", f"user={uid} amount={signed}")
+    verb = "qo'shdi" if signed > 0 else "ayirdi"
+    await safe_send(bot, uid, f"🪙 Admin balansingizga {abs(signed)} tanga {verb}. Yangi balans: <b>{balance}</b>")
+    await message.answer(f"✅ Bajarildi. Yangi balans: <b>{balance}</b>")
+    await show_user_card(message, db, uid)
+
+
+@admin_router.callback_query(F.data.startswith("ad:tar:"))
+async def cb_admin_tariff(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 3)
+    uid = to_int(p[2]) if p else None
+    user = await db.get_user(uid) if uid is not None else None
+    if user is None:
+        return await cb.answer("Foydalanuvchi topilmadi.", show_alert=True)
+    rows = [[btn(("✅ " if t == user["tariff"] else "") + t, f"ad:tpick:{uid}:{i}")] for i, t in enumerate(TARIFF_ORDER)]
+    rows.append([btn("⬅️ Orqaga", f"ad:u:{uid}")])
+    await show(cb, f"🎫 <code>{uid}</code> uchun yangi tarifni tanlang (hozir: <b>{esc(user['tariff'])}</b>):", ikb(*rows))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:tpick:"))
+async def cb_admin_tariff_pick(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 4)
+    uid, idx = (to_int(p[2]), to_int(p[3])) if p else (None, None)
+    if uid is None or idx is None or idx >= len(TARIFF_ORDER):
+        return await cb.answer("Eskirgan tugma.")
+    tariff = TARIFF_ORDER[idx]
+    user = await db.get_user(uid)
+    if user is None:
+        return await cb.answer("Foydalanuvchi topilmadi.", show_alert=True)
+    info = await db.bonus_info(uid, tariff)
+    bonus_line = {
+        "available": f"🎁 Bir martalik bonus: <b>+{TARIFFS[tariff]['bonus']} 🪙</b> (hali berilmagan, hozir beriladi)",
+        "claimed": "🎁 Bu tarif bonusi avval berilgan - qayta berilmaydi.",
+        "none": "🎁 Bu tarifda faollashtirish bonusi yo'q.",
+    }[info]
+    await show(
+        cb,
+        f"❓ <b>Tasdiqlang</b>\n\nFoydalanuvchi: <code>{uid}</code>\n"
+        f"Tarif: <b>{esc(user['tariff'])}</b> → <b>{esc(tariff)}</b>\n{bonus_line}",
+        ikb([btn("✅ Tasdiqlash", f"ad:tok:{uid}:{idx}"), btn("❌ Bekor", f"ad:u:{uid}")]),
+    )
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:tok:"))
+async def cb_admin_tariff_confirm(cb: CallbackQuery, db: Database, bot: Bot):
+    p = cb_parts(cb, 4)
+    uid, idx = (to_int(p[2]), to_int(p[3])) if p else (None, None)
+    if uid is None or idx is None or idx >= len(TARIFF_ORDER):
+        return await cb.answer("Eskirgan tugma.")
+    try:
+        res = await db.set_tariff(uid, TARIFF_ORDER[idx])
+    except BotError as exc:
+        return await cb.answer(str(exc), show_alert=True)
+    await db.audit(cb.from_user.id, "tariff", f"user={uid} {res['old']}->{res['new']} bonus={res['bonus']}")
+    note = f"\n🎁 Bonus: +{res['bonus']} 🪙 (balans: {res['balance']})" if res["bonus"] else ""
+    await safe_send(bot, uid, f"💎 Tarifingiz <b>{esc(res['new'])}</b> ga o'zgartirildi.{note}")
+    await cb.answer("✅ Tarif o'zgartirildi")
+    await show_user_card(cb, db, uid)
+
+
+# ---------- modellar va telefon sozlamalari ----------
+def admin_model_kb(model_id: int, brand: str) -> InlineKeyboardMarkup:
+    fields = [btn("✏️ " + label, f"ad:mf:{model_id}:{i}") for i, (_c, label, _kt) in enumerate(PHONE_FIELDS)]
+    return ikb(
+        *grid(fields, 2),
+        [btn("🏷 Nomini o'zgartirish", f"ad:mr:{model_id}"), btn("🗑 O'chirish", f"ad:md:{model_id}")],
+        [btn("⬅️ Modellar", f"ad:ml:{brand}:0")],
+    )
+
+
+async def show_admin_model(event, db: Database, model_id: int) -> None:
+    model = await db.get_model(model_id)
+    if model is None:
+        return await show(event, "❌ Model topilmadi.", ikb([btn("⬅️ Modellar", "ad:mod")]))
+    await show(event, render_settings(model, show_kt=True, admin=True) +
+               "\n\n<i>Tahrirlash uchun maydonni tanlang.</i>", admin_model_kb(model_id, model["brand"]))
+
+
+@admin_router.callback_query(F.data == "ad:mod")
+async def cb_admin_models(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    items = [btn(label, f"ad:ml:{k}:0") for k, label in BRANDS.items()]
+    await show(cb, "📱 <b>Modellar</b>\n\nBrendni tanlang:", ikb(*grid(items, 2), [BACK_ADMIN]))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:ml:"))
+async def cb_admin_model_list(cb: CallbackQuery, state: FSMContext, db: Database):
+    p = cb_parts(cb, 4)
+    page = to_int(p[3]) if p else None
+    if not p or p[2] not in BRANDS or page is None:
+        return await cb.answer("Eskirgan tugma.")
+    await state.clear()
+    brand = p[2]
+    rows, total, page = await db.list_models(brand, page, PER_PAGE_MODELS)
+    footer = [[btn("➕ Model qo'shish", f"ad:maddb:{brand}")], [btn("⬅️ Brendlar", "ad:mod")]]
+    await show(cb, f"📱 <b>{esc(BRANDS[brand])}</b> - modellar: {total}",
+               models_kb(rows, total, page, "ad:m", f"ad:ml:{brand}", footer))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:maddb:"))
+async def cb_admin_model_add(cb: CallbackQuery, state: FSMContext):
+    p = cb_parts(cb, 3)
+    if not p or p[2] not in BRANDS:
+        return await cb.answer("Eskirgan tugma.")
+    await ask(cb, state, AdminStates.model_name,
+              f"➕ <b>{esc(BRANDS[p[2]])}</b> uchun yangi model nomini yuboring (2-40 belgi):",
+              back=f"ad:ml:{p[2]}:0", brand=p[2])
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.model_name, PlainText())
+async def admin_model_name(message: Message, state: FSMContext, db: Database):
+    name = " ".join(message.text.split())
+    if not 2 <= len(name) <= 40:
+        return await message.answer("❗ Nom 2 dan 40 gacha belgidan iborat bo'lsin.")
+    brand = (await state.get_data()).get("brand")
+    try:
+        model_id = await db.add_model(brand, name)
+    except BotError as exc:
+        return await message.answer(f"❌ {esc(exc)} Boshqa nom yuboring.")
+    await state.clear()
+    await db.audit(message.from_user.id, "model_add", f"{brand}:{name}")
+    await message.answer("✅ Model qo'shildi.")
+    await show_admin_model(message, db, model_id)
+
+
+@admin_router.callback_query(F.data.startswith("ad:m:"))
+async def cb_admin_model(cb: CallbackQuery, state: FSMContext, db: Database):
+    p = cb_parts(cb, 3)
+    model_id = to_int(p[2]) if p else None
+    if model_id is None:
+        return await cb.answer("Eskirgan tugma.")
+    await state.clear()
+    await show_admin_model(cb, db, model_id)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:mf:"))
+async def cb_admin_field(cb: CallbackQuery, state: FSMContext):
+    p = cb_parts(cb, 4)
+    model_id, idx = (to_int(p[2]), to_int(p[3])) if p else (None, None)
+    if model_id is None or idx is None or idx >= len(PHONE_FIELDS):
+        return await cb.answer("Eskirgan tugma.")
+    col, label, _kt = PHONE_FIELDS[idx]
+    if col == "gyro_mode":  # faqat 100Hz / 60Hz / 30Hz dan bittasi
+        modes = [btn(m, f"ad:gm:{model_id}:{i}") for i, m in enumerate(GYRO_MODES)]
+        await show(cb, "🌀 <b>GYRO MODE</b> ni tanlang:",
+                   ikb(modes, [btn("🧹 Tozalash", f"ad:gm:{model_id}:x")], [btn("⬅️ Orqaga", f"ad:m:{model_id}")]))
+    else:
+        await ask(cb, state, AdminStates.field_value,
+                  f"✏️ <b>{label}</b> uchun yangi qiymatni yuboring (maks. 200 belgi).\n"
+                  "Qiymatni o'chirish uchun <code>-</code> yuboring.",
+                  back=f"ad:m:{model_id}", model_id=model_id, idx=idx)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:gm:"))
+async def cb_admin_gyro(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 4)
+    model_id = to_int(p[2]) if p else None
+    if model_id is None:
+        return await cb.answer("Eskirgan tugma.")
+    if p[3] == "x":
+        value = None
+    else:
+        i = to_int(p[3])
+        if i is None or i >= len(GYRO_MODES):
+            return await cb.answer("Eskirgan tugma.")
+        value = GYRO_MODES[i]
+    try:
+        await db.update_setting(model_id, "gyro_mode", value)
+    except BotError as exc:
+        return await cb.answer(str(exc), show_alert=True)
+    await db.audit(cb.from_user.id, "setting", f"model={model_id} gyro_mode={value}")
+    await cb.answer("✅ Saqlandi")
+    await show_admin_model(cb, db, model_id)
+
+
+@admin_router.message(AdminStates.field_value, PlainText())
+async def admin_field_value(message: Message, state: FSMContext, db: Database):
+    text = message.text.strip()
+    if len(text) > 200:
+        return await message.answer("❗ Juda uzun (maks. 200 belgi). Qisqaroq yuboring.")
+    data = await state.get_data()
+    model_id, idx = data.get("model_id"), data.get("idx")
+    if model_id is None or idx is None or idx >= len(PHONE_FIELDS):
+        await state.clear()
+        return await message.answer("Eskirgan so'rov. /admin ni bosing.")
+    value = None if text == "-" else text
+    col = PHONE_FIELDS[idx][0]
+    try:
+        await db.update_setting(model_id, col, value)
+    except BotError as exc:
+        await state.clear()
+        return await message.answer(f"❌ {esc(exc)}")
+    await state.clear()
+    await db.audit(message.from_user.id, "setting", f"model={model_id} {col}={value}")
+    await message.answer("✅ Saqlandi.")
+    await show_admin_model(message, db, model_id)
+
+
+@admin_router.callback_query(F.data.startswith("ad:mr:"))
+async def cb_admin_rename(cb: CallbackQuery, state: FSMContext):
+    p = cb_parts(cb, 3)
+    model_id = to_int(p[2]) if p else None
+    if model_id is None:
+        return await cb.answer("Eskirgan tugma.")
+    await ask(cb, state, AdminStates.model_rename, "🏷 Modelning yangi nomini yuboring (2-40 belgi):",
+              back=f"ad:m:{model_id}", model_id=model_id)
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.model_rename, PlainText())
+async def admin_rename_value(message: Message, state: FSMContext, db: Database):
+    name = " ".join(message.text.split())
+    if not 2 <= len(name) <= 40:
+        return await message.answer("❗ Nom 2 dan 40 gacha belgidan iborat bo'lsin.")
+    model_id = (await state.get_data()).get("model_id")
+    try:
+        await db.rename_model(model_id, name)
+    except BotError as exc:
+        return await message.answer(f"❌ {esc(exc)} Boshqa nom yuboring.")
+    await state.clear()
+    await db.audit(message.from_user.id, "model_rename", f"model={model_id} name={name}")
+    await message.answer("✅ Nom o'zgartirildi.")
+    await show_admin_model(message, db, model_id)
+
+
+@admin_router.callback_query(F.data.startswith("ad:md:"))
+async def cb_admin_delete_ask(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 3)
+    model_id = to_int(p[2]) if p else None
+    model = await db.get_model(model_id) if model_id is not None else None
+    if model is None:
+        return await cb.answer("Model topilmadi.", show_alert=True)
+    await show(cb, f"🗑 <b>{esc(model['name'])}</b> modeli va uning sozlamalari butunlay o'chiriladi. Davom etasizmi?",
+               ikb([btn("✅ Ha, o'chirish", f"ad:mdy:{model_id}"), btn("❌ Yo'q", f"ad:m:{model_id}")]))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:mdy:"))
+async def cb_admin_delete(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 3)
+    model_id = to_int(p[2]) if p else None
+    model = await db.get_model(model_id) if model_id is not None else None
+    if model is None:
+        return await cb.answer("Model topilmadi.", show_alert=True)
+    await db.delete_model(model_id)
+    await db.audit(cb.from_user.id, "model_delete", f"{model['brand']}:{model['name']}")
+    await cb.answer("🗑 O'chirildi")
+    await show(cb, f"🗑 <b>{esc(model['name'])}</b> o'chirildi.", ikb([btn("⬅️ Modellar", f"ad:ml:{model['brand']}:0")]))
+
+
+# ---------- PC bo'limlari (aynan 10 ta; faqat tahrirlanadi) ----------
+@admin_router.callback_query(F.data == "ad:pc")
+async def cb_admin_pc(cb: CallbackQuery, state: FSMContext, db: Database):
+    await state.clear()
+    rows = [[btn(f"{s['num']}. {s['title']}", f"ad:pcs:{s['num']}")] for s in await db.list_pc_sections()]
+    await show(cb, "🖥 <b>PC sozlamalari</b> (10 ta bo'lim)\n\nTahrirlash uchun bo'limni tanlang:", ikb(*rows, [BACK_ADMIN]))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:pcs:"))
+async def cb_admin_pc_section(cb: CallbackQuery, state: FSMContext, db: Database):
+    p = cb_parts(cb, 3)
+    num = to_int(p[2]) if p else None
+    sec = await db.get_pc_section(num) if num is not None else None
+    if sec is None:
+        return await cb.answer("Bo'lim topilmadi.", show_alert=True)
+    await state.clear()
+    content = sec["content"]
+    preview = esc(content[:600]) + ("…" if len(content) > 600 else "") if content else "<i>(bo'sh)</i>"
+    await show(
+        cb, f"🖥 <b>{sec['num']}. {esc(sec['title'])}</b>\n\n{preview}",
+        ikb([btn("✏️ Sarlavha", f"ad:pce:{num}:t"), btn("📝 Matn", f"ad:pce:{num}:c")],
+            [btn("⬅️ Bo'limlar", "ad:pc")]),
+    )
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:pce:"))
+async def cb_admin_pc_edit(cb: CallbackQuery, state: FSMContext):
+    p = cb_parts(cb, 4)
+    num = to_int(p[2]) if p else None
+    if num is None or p[3] not in ("t", "c"):
+        return await cb.answer("Eskirgan tugma.")
+    if p[3] == "t":
+        prompt = f"✏️ {num}-bo'lim uchun yangi <b>sarlavha</b> yuboring (1-40 belgi):"
+    else:
+        prompt = f"📝 {num}-bo'lim uchun yangi <b>matn</b> yuboring (maks. 3500 belgi).\nTozalash uchun <code>-</code> yuboring."
+    await ask(cb, state, AdminStates.pc_value, prompt, back=f"ad:pcs:{num}", num=num, part=p[3])
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.pc_value, PlainText())
+async def admin_pc_value(message: Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    num, part = data.get("num"), data.get("part")
+    if num is None or part not in ("t", "c"):
+        await state.clear()
+        return await message.answer("Eskirgan so'rov. /admin ni bosing.")
+    text = message.text.strip()
+    if part == "t":
+        title = " ".join(text.split())
+        if not 1 <= len(title) <= 40:
+            return await message.answer("❗ Sarlavha 1 dan 40 gacha belgidan iborat bo'lsin.")
+        await db.update_pc_section(num, title=title)
+    else:
+        if len(text) > 3500:
+            return await message.answer(f"❗ Matn juda uzun ({len(text)}). Maksimum 3500 belgi.")
+        await db.update_pc_section(num, content="" if text == "-" else text)
+    await state.clear()
+    await db.audit(message.from_user.id, "pc_section", f"num={num} part={part}")
+    await message.answer("✅ Saqlandi.")
+    sec = await db.get_pc_section(num)
+    await show(message, f"🖥 <b>{sec['num']}. {esc(sec['title'])}</b>",
+               ikb([btn("⬅️ Bo'limlar", "ad:pc")]))
+
+
+# ---------- promokodlar ----------
+async def show_promos(event, db: Database) -> None:
+    promos = await db.list_promos()
+    lines = ["🎟 <b>Promokodlar</b>", ""]
+    if not promos:
+        lines.append("<i>Hozircha promokod yo'q.</i>")
+    for pr in promos:
+        limit = pr["max_uses"] if pr["max_uses"] else "∞"
+        lines.append(f"<code>{esc(pr['code'])}</code> - {pr['coins']} 🪙 · ishlatilgan: {pr['used_count']}/{limit}")
+    rows = [[btn("➕ Yaratish", "ad:prn")]]
+    rows += grid([btn(f"🗑 {pr['code']}", f"ad:prd:{pr['code']}") for pr in promos], 2)
+    rows.append([BACK_ADMIN])
+    await show(event, "\n".join(lines), ikb(*rows))
+
+
+@admin_router.callback_query(F.data == "ad:pr")
+async def cb_admin_promos(cb: CallbackQuery, state: FSMContext, db: Database):
+    await state.clear()
+    await show_promos(cb, db)
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data == "ad:prn")
+async def cb_admin_promo_new(cb: CallbackQuery, state: FSMContext):
+    await ask(cb, state, AdminStates.promo_code,
+              "🎟 Yangi promokod matnini yuboring (3-32 belgi: A-Z, 0-9, _ yoki -):", back="ad:pr")
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.promo_code, PlainText())
+async def admin_promo_code(message: Message, state: FSMContext):
+    code = message.text.strip().upper()
+    if not PROMO_RE.fullmatch(code):
+        return await message.answer("❗ Faqat A-Z, 0-9, _ va - ; uzunligi 3-32 belgi.")
+    await ask(message, state, AdminStates.promo_coins,
+              f"🪙 <code>{esc(code)}</code> necha tanga bersin? (1 - 1 000 000)", back="ad:pr", code=code)
+
+
+@admin_router.message(AdminStates.promo_coins, PlainText())
+async def admin_promo_coins(message: Message, state: FSMContext):
+    coins = parse_int(message.text, 1, 1_000_000)
+    if coins is None:
+        return await message.answer("❗ 1 dan 1 000 000 gacha butun son yuboring.")
+    await ask(message, state, AdminStates.promo_max,
+              "👥 Jami necha foydalanuvchi ishlata oladi? (0 = cheklovsiz)", back="ad:pr", coins=coins)
+
+
+@admin_router.message(AdminStates.promo_max, PlainText())
+async def admin_promo_max(message: Message, state: FSMContext, db: Database):
+    max_uses = parse_int(message.text, 0, 1_000_000)
+    if max_uses is None:
+        return await message.answer("❗ 0 dan 1 000 000 gacha butun son yuboring.")
+    data = await state.get_data()
+    code, coins = data.get("code"), data.get("coins")
+    if not code or coins is None:
+        await state.clear()
+        return await message.answer("Eskirgan so'rov. /admin ni bosing.")
+    try:
+        await db.create_promo(code, coins, max_uses, message.from_user.id)
+    except BotError as exc:
+        await state.clear()
+        return await message.answer(f"❌ {esc(exc)}")
+    await state.clear()
+    await db.audit(message.from_user.id, "promo_create", f"{code} coins={coins} max={max_uses}")
+    await message.answer("✅ Promokod yaratildi.")
+    await show_promos(message, db)
+
+
+@admin_router.callback_query(F.data.startswith("ad:prd:"))
+async def cb_admin_promo_del_ask(cb: CallbackQuery):
+    p = cb_parts(cb, 3)
+    if not p or not PROMO_RE.fullmatch(p[2]):
+        return await cb.answer("Eskirgan tugma.")
+    await show(cb, f"🗑 <code>{esc(p[2])}</code> promokodi o'chirilsinmi?",
+               ikb([btn("✅ Ha", f"ad:prdy:{p[2]}"), btn("❌ Yo'q", "ad:pr")]))
+    await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("ad:prdy:"))
+async def cb_admin_promo_del(cb: CallbackQuery, db: Database):
+    p = cb_parts(cb, 3)
+    if not p or not PROMO_RE.fullmatch(p[2]):
+        return await cb.answer("Eskirgan tugma.")
+    try:
+        await db.delete_promo(p[2])
+    except BotError as exc:
+        await cb.answer(str(exc), show_alert=True)
+    else:
+        await db.audit(cb.from_user.id, "promo_delete", p[2])
+        await cb.answer("🗑 O'chirildi")
+    await show_promos(cb, db)
+
+
+# ---------- xabar yuborish ----------
+BROADCAST = {"running": False}
+BACKGROUND_TASKS = set()
+
+
+async def run_broadcast(bot: Bot, db: Database, admin_id: int, src_chat: int, src_msg: int) -> None:
+    sent = blocked = failed = 0
+    try:
+        ids = await db.all_user_ids()
+        for uid in ids:
+            for _attempt in range(2):
+                try:
+                    await bot.copy_message(chat_id=uid, from_chat_id=src_chat, message_id=src_msg)
+                    sent += 1
+                except TelegramRetryAfter as exc:
+                    await asyncio.sleep(exc.retry_after + 1)
+                    continue
+                except TelegramForbiddenError:
+                    blocked += 1
+                except TelegramAPIError as exc:
+                    failed += 1
+                    log.warning("Broadcast: %s ga yuborilmadi: %s", uid, exc)
+                break
+            else:
+                failed += 1
+            await asyncio.sleep(0.05)  # ~20 xabar/soniya (Telegram limiti ~30/s)
+        await db.audit(admin_id, "broadcast", f"sent={sent} blocked={blocked} failed={failed}")
+        await safe_send(bot, admin_id,
+                        f"📢 <b>Xabar yuborish yakunlandi</b>\n\n✅ Yuborildi: {sent}\n🚫 Bloklagan: {blocked}\n⚠️ Xato: {failed}")
+    except asyncio.CancelledError:
+        log.warning("Broadcast to'xtatildi (server o'chirilmoqda): sent=%s", sent)
+        raise
+    except Exception:
+        log.exception("Broadcast xatosi")
+        await safe_send(bot, admin_id, f"⚠️ Xabar yuborish xato bilan to'xtadi. Yuborilgan: {sent}")
+    finally:
+        BROADCAST["running"] = False
+
+
+@admin_router.callback_query(F.data == "ad:bc")
+async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
+    if BROADCAST["running"]:
+        return await cb.answer("Hozir boshqa xabar yuborilmoqda. Tugashini kuting.", show_alert=True)
+    await ask(cb, state, AdminStates.broadcast_msg,
+              "📢 Barcha foydalanuvchilarga yuboriladigan xabarni yuboring (matn, rasm, video... istalgani).")
+    await cb.answer()
+
+
+@admin_router.message(AdminStates.broadcast_msg, AnyContent())
+async def admin_broadcast_msg(message: Message, state: FSMContext, db: Database):
+    total = len(await db.all_user_ids())
+    await state.update_data(bc_chat=message.chat.id, bc_msg=message.message_id)
+    await message.answer(
+        f"❓ Yuqoridagi xabar <b>{total}</b> ta foydalanuvchiga yuborilsinmi?",
+        reply_markup=ikb([btn("✅ Yuborish", "ad:bcy"), btn("❌ Bekor", "ad:home")]),
+    )
+
+
+@admin_router.callback_query(F.data == "ad:bcy")
+async def cb_admin_broadcast_go(cb: CallbackQuery, state: FSMContext, db: Database, bot: Bot):
+    data = await state.get_data()
+    chat_id, msg_id = data.get("bc_chat"), data.get("bc_msg")
+    await state.clear()
+    if chat_id is None or msg_id is None:
+        return await cb.answer("Eskirgan so'rov. Qaytadan boshlang.", show_alert=True)
+    if BROADCAST["running"]:
+        return await cb.answer("Hozir boshqa xabar yuborilmoqda.", show_alert=True)
+    BROADCAST["running"] = True
+    task = asyncio.create_task(run_broadcast(bot, db, cb.from_user.id, chat_id, msg_id))
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    await show(cb, "📤 Yuborish boshlandi. Tugagach hisobot keladi.", ikb([BACK_ADMIN]))
+    await cb.answer()
+
+
+# ============================================================================
+# XATOLARNI USHLASH
+# ============================================================================
+async def on_error(event: ErrorEvent) -> bool:
+    log.error("Update'ni qayta ishlashda xato: %r", event.exception, exc_info=event.exception)
+    update = event.update
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("⚠️ Xatolik yuz berdi. Keyinroq urinib ko'ring.", show_alert=True)
+        elif update.message:
+            await update.message.answer("⚠️ Xatolik yuz berdi. Keyinroq urinib ko'ring.")
+    except Exception as exc:  # foydalanuvchiga xabar berib bo'lmasa ham bot ishlashda davom etadi
+        log.debug("Xatolik haqida xabar berib bo'lmadi: %s", exc)
+    return True
+
+
+# ============================================================================
+# DISPATCHER VA WEB-ILOVA
+# ============================================================================
+def build_dispatcher(settings: Settings, db: Database) -> Dispatcher:
+    kwargs = {"storage": MemoryStorage()}  # FSM holati xotirada (qayta ishga tushganda tozalanadi)
+    if SimpleEventIsolation is not None:
+        kwargs["events_isolation"] = SimpleEventIsolation()
+    dp = Dispatcher(**kwargs)
+    dp["settings"] = settings
+    dp["db"] = db
+    dp.errors.register(on_error)
+    dp.include_router(admin_router)  # tartib muhim: admin handlerlari birinchi
+    dp.include_router(user_router)
+    return dp
+
+
+async def configure_webhook(bot: Bot, dp: Dispatcher, settings: Settings) -> None:
+    url = settings.webhook_base + settings.webhook_path
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            await bot.set_webhook(
+                url=url,
+                secret_token=settings.webhook_secret,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=False,
+                max_connections=40,
+            )
+            info = await bot.get_webhook_info()
+            log.info("Webhook o'rnatildi: %s/webhook/*** (kutilayotgan update'lar: %s)",
+                     settings.webhook_base, info.pending_update_count)
+            if info.last_error_message:
+                log.warning("Telegram oxirgi webhook xatosi: %s", info.last_error_message)
+            return
+        except TelegramUnauthorizedError:
+            raise
+        except TelegramAPIError as exc:
+            last_exc = exc
+            log.warning("set_webhook %s/5 muvaffaqiyatsiz: %s", attempt, exc)
+            await asyncio.sleep(2 * attempt)
+    raise RuntimeError(f"Webhook o'rnatib bo'lmadi: {last_exc}")
+
+
+def create_app(settings: Settings) -> web.Application:
+    db = Database(settings.database_url or None, settings.db_path, settings.player_bonus_on_start)
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
+    )
+    dp = build_dispatcher(settings, db)
+
+    async def health(_request: web.Request) -> web.Response:
+        try:
+            await db.fetchval("SELECT 1")
+        except Exception:
+            log.exception("/health: baza javob bermadi")
+            return web.json_response({"status": "error", "db": "down"}, status=503)
+        return web.json_response({"status": "ok", "db": db.backend})
+
+    async def lifecycle(_app: web.Application):
+        await db.connect()
+        try:
+            me = await bot.get_me()  # tokenni darhol tekshiradi
+            dp["bot_username"] = me.username
+            log.info("Bot: @%s | baza: %s | adminlar: %d ta", me.username, db.backend, len(settings.admin_ids))
+            if db.backend == "sqlite":
+                log.info("SQLite fayli: %s (qayta deploy'da yo'qolmasligi uchun doimiy diskda bo'lsin!)",
+                         os.path.abspath(settings.db_path))
+            await configure_webhook(bot, dp, settings)
+            yield
+        finally:
+            # Webhook ATAYIN o'chirilmaydi: yangi nusxa allaqachon o'rnatgan bo'lishi mumkin.
+            for task in list(BACKGROUND_TASKS):
+                task.cancel()
+            if BACKGROUND_TASKS:
+                await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+            await bot.session.close()  # HTTP sessiyani yopish
+            await db.close()
+            log.info("To'xtatildi: bot sessiyasi va baza yopildi")
+
     app = web.Application()
-    app.router.add_get("/", lambda request: web.json_response({"status":"ok","service":"SO2 SETTINGS BOT"}))
-    app.router.add_get("/health", lambda request: web.json_response({"status":"ok"}))
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=settings.webhook_secret).register(
+        app, path=settings.webhook_path)
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_shutdown)
+    app.cleanup_ctx.append(lifecycle)
     return app
 
-app = create_app()
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    settings = load_settings()
+    app = create_app(settings)
+    web.run_app(app, host="0.0.0.0", port=settings.port, access_log=None, print=None)
+
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    main()
