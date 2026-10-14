@@ -232,6 +232,10 @@ class FailLimiter:
         return 0
 
     def add(self, key) -> None:
+        if len(self.hits) > 2000:  # xotira o'smasligi uchun eskirgan yozuvlarni tozalaymiz
+            now = time.monotonic()
+            for k in [k for k, q in self.hits.items() if not q or now - q[-1] > self.window]:
+                del self.hits[k]
         self.hits[key].append(time.monotonic())
 
 
@@ -280,7 +284,7 @@ HELP_TEXT = (
 
 PC_LOCKED = (
     "🔒 <b>PC sozlamalari yopiq</b>\n\n"
-    "Bu bo'lim faqat <b>PREMIUM</b> va <b>KT CREATOR</b> tarifi uchun.\n\n"
+    "PC sozlamalari barcha tariflar uchun bepul.\n\n"
     f"Tarif olish uchun @{SUPPORT_USERNAME} bilan bog'laning."
 )
 
@@ -447,7 +451,7 @@ async def cb_settings_root(cb: CallbackQuery):
 
 @user_router.callback_query(F.data == "st:android")
 async def cb_android(cb: CallbackQuery):
-    brands = [btn(BRANDS[k], f"st:b:{k}:0") for k in ("redmi", "samsung", "honor")]
+    brands = [btn(BRANDS[k], f"st:b:{k}:0") for k in ("redmi", "samsung", "honor", "xiaomi", "poco", "realme", "infinix", "tecno", "oneplus")]
     await show(cb, "🤖 <b>Android</b>\n\nBrendni tanlang:", ikb(brands, [btn("⬅️ Orqaga", "st:root")]))
     await cb.answer()
 
@@ -1354,7 +1358,7 @@ async def configure_webhook(bot: Bot, dp: Dispatcher, settings: Settings) -> Non
                 secret_token=settings.webhook_secret,
                 allowed_updates=dp.resolve_used_update_types(),
                 drop_pending_updates=False,
-                max_connections=40,
+                max_connections=10,  # kichik (bepul) server uchun parallellikni cheklaydi
             )
             info = await bot.get_webhook_info()
             log.info("Webhook o'rnatildi: %s/webhook/*** (kutilayotgan update'lar: %s)",
@@ -1387,6 +1391,9 @@ def create_app(settings: Settings) -> web.Application:
             return web.json_response({"status": "error", "db": "down"}, status=503)
         return web.json_response({"status": "ok", "db": db.backend})
 
+    async def ping(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")  # bazaga tegmaydi: tez-tez so'raladigan monitoring/uyg'otish uchun
+
     async def lifecycle(_app: web.Application):
         await db.connect()
         try:
@@ -1394,8 +1401,9 @@ def create_app(settings: Settings) -> web.Application:
             dp["bot_username"] = me.username
             log.info("Bot: @%s | baza: %s | adminlar: %d ta", me.username, db.backend, len(settings.admin_ids))
             if db.backend == "sqlite":
-                log.info("SQLite fayli: %s (qayta deploy'da yo'qolmasligi uchun doimiy diskda bo'lsin!)",
-                         os.path.abspath(settings.db_path))
+                log.warning("SQLite ishlatilmoqda: %s. Hosting fayl tizimi vaqtincha bo'lsa (bepul rejalar), "
+                            "qayta deploy/uyqudan keyin BARCHA MA'LUMOT YO'QOLADI. Doimiy saqlash uchun "
+                            "DATABASE_URL (tashqi PostgreSQL) bering.", os.path.abspath(settings.db_path))
             await configure_webhook(bot, dp, settings)
             yield
         finally:
@@ -1411,6 +1419,7 @@ def create_app(settings: Settings) -> web.Application:
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/ping", ping)
     SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=settings.webhook_secret).register(
         app, path=settings.webhook_path)
     setup_application(app, dp, bot=bot)

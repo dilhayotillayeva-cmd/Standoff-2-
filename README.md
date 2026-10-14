@@ -9,7 +9,7 @@ Ma'lumotlar bazasi: **SQLite** (`DB_PATH`) yoki tashqi **PostgreSQL** (`DATABASE
 |---|---|
 | `bot.py` | Sozlamalar, foydalanuvchi va admin handlerlari, aiohttp webhook, `/health` |
 | `db.py` | Baza qatlami (SQLite + PostgreSQL) va butun biznes-mantiq (tanga, referal, bonus, promokod) |
-| `tests/test_db.py` | Baza mantiqi testlari (faqat standart kutubxona) |
+| `tests/` | Baza mantiqi testlari (`test_db.py` - SQLite, `test_pg_shim.py` - PostgreSQL kod yo'li taqlidi); faqat standart kutubxona |
 | `requirements.txt`, `.python-version` | Bog'liqliklar, Python 3.11 |
 | `render.yaml`, `Procfile`, `Dockerfile` | Hosting konfiguratsiyalari |
 | `.env.example` | Muhit o'zgaruvchilari namunasi |
@@ -30,20 +30,26 @@ Ma'lumotlar bazasi: **SQLite** (`DB_PATH`) yoki tashqi **PostgreSQL** (`DATABASE
 
 Xato yoki yetishmayotgan o'zgaruvchida bot aniq xabar bilan darhol to'xtaydi.
 
-## Ma'lumotlar qayta deploy'da yo'qolmasligi
+## Bepul hosting (512 MB RAM) va tashqi baza
 
-Konteyner/hostning o'z fayl tizimi **vaqtinchalik**. Ikki yo'l bor:
+**Xotira.** Bot yengil qilingan: baza pooli 3 ta ulanish, webhook parallelligi 10, FSM/limiter xotirasi cheklangan, `MALLOC_ARENA_MAX=2`. Baza hajmi o'lchandi: **20 000 foydalanuvchi + 20 000 referal + 60 000 tranzaksiya ≈ 9 MB** (SQLite; PostgreSQL biroz kattaroq bo'ladi - o'lchanmagan). Botning jami RAM sarfini aiogram bilan o'lchab ko'rmadim: bunday bot 512 MB ga sig'ishi kutiladi (taxmin), Render → *Metrics* da kuzating.
 
-1. **PostgreSQL (tavsiya)** - `DATABASE_URL` ni kiriting (Neon, Supabase, Railway Postgres va h.k.). Bepul rejalarda ham ishlaydi.
-2. **SQLite + doimiy disk** - diskni ulab, `DB_PATH` ni shu disk ichiga yo'naltiring (masalan `/data/bot.db`).
-   Render'da disk faqat pullik rejada bor (`render.yaml` shunga yozilgan); Railway'da Volume ulang.
+**⚠️ Hozircha SQLite = faqat sinov.** Bepul rejada fayl tizimi vaqtincha: SQLite fayli har deploy va uyqudan keyin yo'qoladi (bot buni ishga tushganda logda ogohlantiradi). Haqiqiy foydalanuvchilar kelishidan oldin tashqi baza ulang.
 
-Bot ishga tushganda qaysi baza ishlatilayotganini logga yozadi. Sxema avtomatik yaratiladi, namunaviy modellar faqat **birinchi** ishga tushirishda qo'shiladi (admin o'chirgan model qayta tiklanmaydi).
+**Keyin tashqi bazaga o'tish** (kodni o'zgartirish shart emas):
+1. Bepul PostgreSQL oching (masalan Neon yoki Supabase; hozirgi bepul limitlarni saytidan tekshiring).
+2. Ulanish manzilini Render → *Environment* → `DATABASE_URL` ga qo'ying (Neon uchun odatda `...?sslmode=require`) va qayta deploy qiling.
+3. Jadvallar va namunaviy modellar avtomatik yaratiladi. SQLite'dagi eski ma'lumot ko'chirilmaydi (bepul rejada baribir saqlanmagan); kerak bo'lsa ko'chirish skriptini yozib beraman.
+
+PostgreSQL uchun moslashtirishlar: `statement_cache_size=0` (PgBouncer "pooler" manzillari bilan ishlashi uchun), sxema yaratish bitta tranzaksiyada `pg_advisory_xact_lock` bilan, bo'sh ulanishlar 2 daqiqada yopiladi va uzilgan ulanishda oddiy so'rov bir marta qayta uriniladi (bepul baza uxlab qolganda). Tranzaksiya ichida uzilish bo'lsa foydalanuvchi "Xatolik" xabarini ko'radi, keyingi urinish ishlaydi.
+
+**Uyqu.** Render bepul web xizmati bir muddat so'rovsiz qolsa uxlaydi; Telegram yangi xabar yuborganda uyg'onadi, lekin birinchi javob sekin bo'ladi (yarim daqiqadan ortishi mumkin). Uyg'oq tutish uchun tashqi monitor (masalan UptimeRobot) har ~10 daqiqada `GET https://<xizmat>/ping` ni chaqirsin. **`/ping` bazaga tegmaydi** - shuning uchun bepul PostgreSQL ham uxlashda davom etadi; `/health` esa bazani tekshiradi, uni tez-tez chaqirmang. Render'ning oylik bepul soat limitini shartlardan tekshiring.
+
+**Doimiy diskli SQLite (pullik reja):** diskni ulab `DB_PATH` ni shu disk ichiga bering (masalan `/data/bot.db`); Render'da `plan: starter` + `disk:` bloki, Railway'da Volume.
 
 ## Deploy
 
-**Render:** repozitoriyni ulang → *Blueprint* (`render.yaml`) → `BOT_TOKEN`, `ADMIN_IDS` ni kiriting. Health check: `/health`.
-Bepul rejada: `render.yaml` dan `disk:` va `DB_PATH` ni olib tashlab, `DATABASE_URL` bering.
+**Render (bepul):** repozitoriyni ulang → *Blueprint* (`render.yaml`) → `BOT_TOKEN`, `ADMIN_IDS` ni kiriting (`WEBHOOK_BASE` bo'sh bo'lsa `RENDER_EXTERNAL_URL` olinadi). Health check: `/ping`. Keyin `DATABASE_URL` qo'shing (yuqoridagi bo'lim).
 
 **Railway / Heroku-simon hostlar:** `Procfile` ishlatiladi (`web: python bot.py`); o'zgaruvchilarni panelda kiriting, `WEBHOOK_BASE` ga xizmatning ochiq HTTPS manzilini bering.
 
@@ -56,7 +62,7 @@ Bepul rejada: `render.yaml` dan `disk:` va `DB_PATH` ni olib tashlab, `DATABASE_
 - Webhook yo'li tokendan hosil qilingan tasodifiy segment bilan: `/webhook/<hash>`; Telegram so'rovlari `X-Telegram-Bot-Api-Secret-Token` bilan tekshiriladi (noto'g'ri bo'lsa 401).
 - `set_webhook` ishga tushganda 5 martagacha qayta uriniladi. Bot to'xtaganda webhook **o'chirilmaydi** (rolling deploy'da yangi nusxa o'rnatgan webhookni eskisi o'chirib yubormasligi uchun).
 - To'xtatishda (SIGTERM/SIGINT): fon vazifalari (xabar yuborish) bekor qilinadi, `bot.session` (HTTP sessiya) va baza ulanishlari yopiladi.
-- `/health` - bazaga `SELECT 1` yuboradi; `200 {"status":"ok"}` yoki baza ishlamasa `503`.
+- `/health` - bazaga `SELECT 1` yuboradi; `200 {"status":"ok"}` yoki baza ishlamasa `503`. `/ping` - bazaga tegmaydigan yengil `ok`.
 - Admin: `ADMIN_IDS` + faqat shaxsiy chat. Admin handlerlari router darajasida filtrlangan (buyruq, tugma va matn kiritish holatlari), begona foydalanuvchi uchun admin tugmalari ishlamaydi. Admin amallari (tanga, tarif, model, promokod, xabar) `admin_log` jadvaliga yoziladi.
 - Foydalanuvchiga ko'rinadigan barcha dinamik matn HTML-escape qilinadi. Tanga amallari atomik tranzaksiyada, balans manfiy bo'lmaydi (`CHECK`).
 - Promokodni terib ko'rishga qarshi: 10 daqiqada 5 ta noto'g'ri urinishdan keyin vaqtincha to'xtatiladi (xotirada; qayta ishga tushganda tozalanadi).
@@ -103,13 +109,14 @@ Quyidagilarni o'zingizga moslab o'zgartirishingiz mumkin:
 ## Nima tekshirildi, nima tekshirilmadi
 
 Haqiqatan bajarilgan:
-- `python -m unittest discover -s tests -v` - **20 ta test o'tdi** (SQLite): bonusning bir martaligi, referal himoyalari (o'zini taklif, takroriy, parallel so'rovlar), promokod qoidalari (kuniga bitta, takroriy, limit, parallel), tranzaksiya rollback, balans manfiy bo'lmasligi, 10 ta PC bo'lim cheklovi, qayta ulanganda ma'lumot saqlanishi.
+- `python -m unittest discover -s tests -v` - **41 ta test o'tdi**: bonusning bir martaligi, referal himoyalari (o'zini taklif, takroriy, parallel so'rovlar), promokod qoidalari (kuniga bitta, takroriy, limit, parallel), tranzaksiya rollback, balans manfiy bo'lmasligi, 10 ta PC bo'lim cheklovi, qayta ulanganda ma'lumot saqlanishi. Xuddi shu to'plam PostgreSQL kod yo'li **taqlidi** (SQLite ustidagi shim) bilan ham o'tdi, shuningdek uzilgan ulanishda qayta urinish.
 - `bot.py` va `db.py` uchun statik tekshiruv: sintaksis, aniqlanmagan nomlar, ishlatilmagan importlar, Python 3.11 bilan mos f-string qoidalari.
-- `bot.py` handlerlari aiogram'ning **yengil soxta (stub) nusxasi** bilan simulyatsiya qilindi: foydalanuvchi va admin oqimlari, FSM, admin himoyasi, 105 ta tugma `callback_data` sining to'g'ri handlerga yetib borishi va 64 bayt chegarasi (82 ta tekshiruv).
+- `bot.py` handlerlari aiogram'ning **yengil soxta (stub) nusxasi** bilan simulyatsiya qilindi: foydalanuvchi va admin oqimlari, FSM, admin himoyasi, 105 ta tugma `callback_data` sining to'g'ri handlerga yetib borishi va 64 bayt chegarasi (82 ta tekshiruv; bu simulyator ZIP'ga kirmagan).
+- Baza hajmi o'lchandi (yuqorida).
 
 **Tekshirilmagan** (muhitda tarmoq va kutubxonalar yo'q edi):
-- `bot.py` **haqiqiy aiogram 3 bilan ishga tushirilmadi** va haqiqiy Telegram'ga ulanmadi (webhook o'rnatish, `SimpleRequestHandler`, `copy_message`, Telegram javoblari). Aiogram API ishlatilishi xotiraga va hujjatlarga asoslangan; birinchi deploy'da loglarni kuzating.
-- **PostgreSQL (`asyncpg`) yo'li ishga tushirilmadi.** Faqat `?` → `$n` almashtirish testlangan; SQL SQLite va PostgreSQL uchun umumiy sintaksisda yozilgan, lekin PostgreSQL'da real sinov o'tkazilmagan.
-- `Dockerfile`, `render.yaml`, `Procfile` build/deploy qilib ko'rilmadi.
+- `bot.py` **haqiqiy aiogram 3 bilan ishga tushirilmadi** va haqiqiy Telegram'ga ulanmadi (webhook o'rnatish, `SimpleRequestHandler`, `copy_message`, Telegram javoblari). Aiogram API ishlatilishi xotiraga va hujjatlarga asoslangan.
+- **Haqiqiy PostgreSQL/`asyncpg` bilan ishga tushirilmadi.** Shim faqat boshqaruv oqimini tekshiradi; turlar, parallel tranzaksiya xatti-harakati, Neon/Supabase pooler bilan ishlashi sinalmagan.
+- Botning real RAM sarfi, `Dockerfile`, `render.yaml`, `Procfile` build/deploy qilib ko'rilmadi.
 
-Birinchi ishga tushirishda tavsiya: `/start`, `/admin`, bitta modelga sozlama kiritish, o'zingizning ikkinchi akkauntingiz bilan referal va promokodni sinab ko'ring.
+Birinchi ishga tushirishda: loglarni kuzating; `/start`, `/admin`, bitta modelga sozlama kiritish, ikkinchi akkaunt bilan referal va promokodni sinab ko'ring; `DATABASE_URL` ulagandan keyin bot qayta ishga tushganda ma'lumot saqlanib qolganini tekshiring.

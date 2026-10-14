@@ -1,25 +1,23 @@
-# Render.com Blueprint.
-# DIQQAT: doimiy disk (disk:) faqat pullik rejada (starter va yuqori) mavjud.
-# Bepul rejada disk yo'q - u holda `disk:` blokini va DB_PATH ni olib tashlab,
-# DATABASE_URL ga tashqi PostgreSQL (masalan Neon/Supabase) manzilini kiriting.
+# Render.com Blueprint - BEPUL reja (512 MB RAM).
+#
+# DIQQAT: bepul rejada doimiy disk yo'q, shuning uchun SQLite fayli har deploy/uyqudan keyin yo'qoladi.
+# Haqiqiy foydalanuvchilar kelishidan oldin Render panelida
+#   Environment -> Add -> DATABASE_URL = <tashqi PostgreSQL manzili>
+# qo'shing (bu faylda ataylab yozilmagan, shunda hozircha bo'sh qoladi).
+# Pullik rejaga o'tsangiz: `plan: starter`, `disk:` blokini qo'shing va DB_PATH=/data/bot.db bering (README).
 services:
   - type: web
     name: standoff2-settings-bot
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /health
-    disk:
-      name: bot-data
-      mountPath: /data
-      sizeGB: 1
+    healthCheckPath: /ping        # bazaga tegmaydi (bepul PostgreSQL uxlab qola oladi)
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_IDS
         sync: false
-      - key: WEBHOOK_BASE        # bo'sh qoldirsa RENDER_EXTERNAL_URL ishlatiladi
-        sync: false
-      - key: DB_PATH
-        value: /data/bot.db
+      - key: MALLOC_ARENA_MAX     # thread'lardan RAM bo'linib ketishini kamaytiradi
+        value: "2"
+      # WEBHOOK_BASE yozilmagan: bo'sh bo'lsa Render'ning RENDER_EXTERNAL_URL i ishlatiladi

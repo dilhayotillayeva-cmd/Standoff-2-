@@ -44,7 +44,7 @@ SUPPORT_USERNAME = "lwox_org"
 # referral - bitta referal uchun tanga; bonus - tarifni faollashtirishdagi bir martalik bonus
 # pc - PC sozlamalariga ruxsat; kt - KT CREATOR qo'shimcha maydonlariga ruxsat
 TARIFFS = {
-    "PLAYER": {"referral": 1, "bonus": 10, "pc": False, "kt": False},
+    "PLAYER": {"referral": 1, "bonus": 10, "pc": True, "kt": False},
     "PREMIUM": {"referral": 2, "bonus": 100, "pc": True, "kt": False},
     "KT CREATOR": {"referral": 2, "bonus": 0, "pc": True, "kt": True},
 }
@@ -52,46 +52,40 @@ TARIFF_ORDER = tuple(TARIFFS)
 DEFAULT_TARIFF = "PLAYER"
 
 # brend kaliti -> ko'rsatiladigan nom
-BRANDS = {"iphone": "iPhone", "redmi": "Redmi", "samsung": "Samsung", "honor": "Honor"}
-
-# (ustun, yorliq, faqat KT CREATOR uchunmi) - ko'rsatish tartibi shu bo'yicha
+BRANDS = {
+    "iphone": "iPhone", "redmi": "Redmi", "samsung": "Samsung",
+    "honor": "Honor", "xiaomi": "Xiaomi", "poco": "POCO",
+    "realme": "Realme", "infinix": "Infinix", "tecno": "Tecno",
+    "oneplus": "OnePlus",
+}
 PHONE_FIELDS = [
-    ("device", "DEVICE", False),
-    ("sens", "SENS", False),
-    ("scope_sens", "SCOPE SENS", False),
-    ("gyro_mode", "GYRO MODE", False),
-    ("gyro_sens", "SENS (GYRO)", False),
-    ("gyro_scope_sens", "SCOPE SENS (GYRO)", False),
-    ("taken_at", "OLINGAN VAQT", False),
-    ("profile_id", "PROFIL ID", False),
-    ("accelerator", "ACCELERATOR", True),
-    ("small_holder", "KICHIK USHLAGICH", True),
+    ("device", "DEVICE", False), ("sens", "SENS", False),
+    ("scope_sens", "SCOPE SENS", False), ("gyro_mode", "GYRO MODE", False),
+    ("gyro_sens", "SENS (GYRO)", False), ("gyro_scope_sens", "SCOPE SENS (GYRO)", False),
+    ("taken_at", "OLINGAN VAQT", False), ("profile_id", "PROFIL ID", False),
+    ("accelerator", "ACCELERATOR", True), ("small_holder", "KICHIK USHLAGICH", True),
 ]
-PHONE_COLUMNS = tuple(col for col, _label, _kt in PHONE_FIELDS)  # SQL uchun oq ro'yxat
+PHONE_COLUMNS = tuple(col for col, _label, _kt in PHONE_FIELDS)
 GYRO_MODES = ("100Hz", "60Hz", "30Hz")
-
-# Aynan 10 ta PC bo'limi. Sarlavhalar boshlang'ich (namuna); admin tahrirlaydi.
 PC_DEFAULT_TITLES = [
-    "Emulator sozlamalari",
-    "Sichqoncha va sezgirlik",
-    "Klaviatura (boshqaruv)",
-    "Grafika sozlamalari",
-    "FPS va unumdorlik",
-    "Ovoz sozlamalari",
-    "Tarmoq va ping",
-    "Windows optimallashtirish",
-    "Ekran va monitor",
-    "Qo'shimcha maslahatlar",
+    "PC profil 01 — Balansli", "PC profil 02 — Past sezgirlik",
+    "PC profil 03 — Yuqori sezgirlik", "PC profil 04 — Agressiv",
+    "PC profil 05 — Aniqlik", "PC profil 06 — Snayper",
+    "PC profil 07 — Rifler", "PC profil 08 — Entry fragger",
+    "PC profil 09 — Support", "PC profil 10 — Barqaror FPS",
+    *[f"PC profil {n:02d} — Individual" for n in range(11, 51)],
 ]
-PC_SECTION_COUNT = len(PC_DEFAULT_TITLES)  # 10
-
-# Namunaviy modellar (faqat birinchi ishga tushirishda qo'shiladi). Sozlama qiymatlari BO'SH.
+PC_SECTION_COUNT = len(PC_DEFAULT_TITLES)
 SEED_MODELS = {
-    "iphone": [f"iPhone {n}" for n in range(11, 18)],
-    "redmi": ["Redmi Note 11", "Redmi Note 12", "Redmi Note 13", "Redmi 12", "Redmi 13C"],
-    "samsung": ["Samsung Galaxy A15", "Samsung Galaxy A25", "Samsung Galaxy A35",
-                "Samsung Galaxy A55", "Samsung Galaxy S23", "Samsung Galaxy S24"],
-    "honor": ["Honor X7b", "Honor X8b", "Honor X9b", "Honor 90 Lite"],
+    "redmi": ["Redmi Note 10S", "Redmi Note 11", "Redmi Note 11 Pro", "Redmi Note 12", "Redmi Note 12 Pro", "Redmi Note 13", "Redmi Note 13 Pro", "Redmi 12", "Redmi 13C"],
+    "samsung": ["Samsung Galaxy A14", "Samsung Galaxy A15", "Samsung Galaxy A24", "Samsung Galaxy A25", "Samsung Galaxy A34", "Samsung Galaxy A35", "Samsung Galaxy A54", "Samsung Galaxy A55", "Samsung Galaxy S23", "Samsung Galaxy S24"],
+    "honor": ["Honor X7b", "Honor X8b", "Honor X9b", "Honor 90 Lite", "Honor X9c"],
+    "xiaomi": ["Xiaomi 12", "Xiaomi 12T", "Xiaomi 13", "Xiaomi 13T", "Xiaomi 14"],
+    "poco": ["POCO X5", "POCO X5 Pro", "POCO X6", "POCO X6 Pro", "POCO F5"],
+    "realme": ["Realme 10", "Realme 11", "Realme 12", "Realme C55"],
+    "infinix": ["Infinix Note 30", "Infinix Note 40", "Infinix Hot 40", "Infinix GT 20 Pro"],
+    "tecno": ["Tecno Spark 20", "Tecno Spark 20 Pro", "Tecno Pova 5", "Tecno Pova 6"],
+    "oneplus": ["OnePlus Nord CE 3", "OnePlus Nord CE 4", "OnePlus 11", "OnePlus 12"],
 }
 
 
@@ -162,7 +156,7 @@ SCHEMA = [
         updated_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS pc_sections (
-        num INTEGER PRIMARY KEY CHECK (num BETWEEN 1 AND 10),
+        num INTEGER PRIMARY KEY CHECK (num BETWEEN 1 AND 50),
         title TEXT NOT NULL,
         content TEXT NOT NULL DEFAULT ''
     )""",
@@ -194,6 +188,8 @@ SCHEMA = [
 ]
 
 PG_ADVISORY_KEY = 727272001  # bir vaqtda ikki nusxa sxema yaratib yubormasligi uchun
+PG_PK = "BIGSERIAL PRIMARY KEY"
+SQLITE_PK = "INTEGER PRIMARY KEY AUTOINCREMENT"
 
 
 @lru_cache(maxsize=1024)
@@ -295,6 +291,7 @@ class Database(_Queryable):
         self._pool = None
         self._conn = None
         self._lock = None
+        self._transient = ()  # PostgreSQL uzilish xatolari (connect() da to'ldiriladi)
 
     @property
     def backend(self) -> str:
@@ -305,23 +302,20 @@ class Database(_Queryable):
         if self.database_url:
             import asyncpg  # faqat PostgreSQL rejimida kerak
 
+            # Kichik pool - bepul hosting (512 MB RAM) va bepul PostgreSQL ulanish limitlari uchun.
+            # statement_cache_size=0 - PgBouncer (Neon/Supabase "pooler") bilan mos ishlashi uchun.
+            # max_inactive_connection_lifetime - bepul PostgreSQL uxlab qolganda eskirgan ulanish qolmasin.
             self._pool = await asyncpg.create_pool(
-                self.database_url, min_size=1, max_size=5, command_timeout=30
+                self.database_url, min_size=1, max_size=3, command_timeout=30,
+                statement_cache_size=0, max_inactive_connection_lifetime=120,
             )
+            self._transient = (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError)
             log.info("PostgreSQL'ga ulandi")
-            async with self._pool.acquire() as lock_conn:
-                await lock_conn.execute("SELECT pg_advisory_lock($1)", PG_ADVISORY_KEY)
-                try:
-                    await self._create_schema()
-                    await self._seed()
-                finally:
-                    await lock_conn.execute("SELECT pg_advisory_unlock($1)", PG_ADVISORY_KEY)
         else:
             self._lock = asyncio.Lock()
             self._conn = await asyncio.to_thread(self._open_sqlite)
             log.info("SQLite ochildi: %s", os.path.abspath(self.db_path))
-            await self._create_schema()
-            await self._seed()
+        await self._init_schema()
 
     def _open_sqlite(self):
         if sqlite3.sqlite_version_info < (3, 35, 0):
@@ -353,18 +347,28 @@ class Database(_Queryable):
         finally:
             cur.close()
 
+    @staticmethod
+    def _pg_runner(conn):
+        async def run(sql, args):
+            return [dict(r) for r in await conn.fetch(to_pg(sql), *args)]
+
+        return run
+
     async def fetchall(self, sql: str, *args) -> list:
         if self._pool is not None:
-            return [dict(r) for r in await self._pool.fetch(to_pg(sql), *args)]
+            for attempt in (1, 2):
+                try:
+                    return [dict(r) for r in await self._pool.fetch(to_pg(sql), *args)]
+                except self._transient as exc:  # ulanish uzilgan (masalan bepul baza uxlab qolgan) - bir marta qayta urinamiz
+                    if attempt == 2:
+                        raise
+                    log.warning("PostgreSQL ulanishi uzilgan (%s), qayta uriniladi", exc)
         async with self._lock:
             return await asyncio.to_thread(self._sqlite_run, sql, args)
 
-    async def _ddl(self, sql: str) -> None:
-        if self._pool is not None:
-            await self._pool.execute(sql)
-        else:
-            async with self._lock:
-                await asyncio.to_thread(self._sqlite_run, sql, ())
+    async def _ddl(self, sql: str) -> None:  # faqat SQLite
+        async with self._lock:
+            await asyncio.to_thread(self._sqlite_run, sql, ())
 
     @asynccontextmanager
     async def transaction(self):
@@ -373,10 +377,7 @@ class Database(_Queryable):
         if self._pool is not None:
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
-                    async def run_pg(sql, args):
-                        return [dict(r) for r in await conn.fetch(to_pg(sql), *args)]
-
-                    yield _Tx(run_pg)
+                    yield _Tx(self._pg_runner(conn))
             return
 
         async with self._lock:
@@ -398,25 +399,58 @@ class Database(_Queryable):
                         await asyncio.shield(run_sqlite("ROLLBACK", ()))
                     raise
 
-    async def _create_schema(self) -> None:
-        pk = "BIGSERIAL PRIMARY KEY" if self._pool is not None else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        for stmt in SCHEMA:
-            await self._ddl(stmt.replace("{pk}", pk))
+    async def _init_schema(self) -> None:
+        """Sxemani yaratadi va boshlang'ich ma'lumotni qo'shadi (har ishga tushganda xavfsiz)."""
+        if self._pool is not None:
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    # Tranzaksiya darajasidagi qulf: ikki nusxa bir vaqtda sxema yaratmasin
+                    # (PgBouncer transaction rejimida ham xavfsiz - hammasi bitta tranzaksiyada).
+                    await conn.execute("SELECT pg_advisory_xact_lock($1)", PG_ADVISORY_KEY)
+                    for stmt in SCHEMA:
+                        await conn.execute(stmt.replace("{pk}", PG_PK))
+                    await self._seed(_Tx(self._pg_runner(conn)))
+        else:
+            for stmt in SCHEMA:
+                await self._ddl(stmt.replace("{pk}", SQLITE_PK))
+            async with self.transaction() as q:
+                await self._seed(q)
 
-    async def _seed(self) -> None:
-        async with self.transaction() as q:
-            for num, title in enumerate(PC_DEFAULT_TITLES, start=1):
-                await q.execute(
-                    "INSERT INTO pc_sections (num, title, content) VALUES (?, ?, '') "
-                    "ON CONFLICT (num) DO NOTHING", num, title)
-            done = await q.fetchone("SELECT value FROM meta WHERE name = 'models_seeded'")
-            if done is None:
-                for brand, names in SEED_MODELS.items():
-                    for name in names:
-                        await _insert_model(q, brand, name)
-                await q.execute("INSERT INTO meta (name, value) VALUES ('models_seeded', '1') "
-                                "ON CONFLICT (name) DO NOTHING")
-                log.info("Namunaviy modellar qo'shildi")
+    async def _seed(self, q) -> None:
+        for num, title in enumerate(PC_DEFAULT_TITLES, start=1):
+            content = (
+                f"🆔 Profil ID: PC-{num:02d}\n"
+                f"🖱️ DPI: {400 + (num % 7) * 100}\n"
+                f"🎯 Sensitivity: {0.8 + (num % 13) * 0.17:.2f}\n"
+                f"🔭 Scope sensitivity: {0.7 + (num % 9) * 0.19:.2f}\n"
+                "⌨️ Boshqaruv: standart, o'zingizga moslab sozlang.\n\n"
+                "ℹ️ Namunaviy profil: o'yin va emulyator versiyasiga qarab sinab, moslashtiring."
+            )
+            await q.execute(
+                "INSERT INTO pc_sections (num, title, content) VALUES (?, ?, ?) "
+                "ON CONFLICT (num) DO NOTHING", num, title, content)
+        done = await q.fetchone("SELECT value FROM meta WHERE name = 'models_seeded'")
+        # Har ishga tushishda modellarni xavfsiz qo'shish: mavjud ma'lumotlar saqlanadi.
+        for brand, names in SEED_MODELS.items():
+            for name in names:
+                model_id = await _insert_model(q, brand, name)
+                if model_id is None:
+                    existing = await q.fetchone(
+                        "SELECT id FROM models WHERE brand = ? AND name = ?", brand, name)
+                    model_id = existing["id"] if existing else None
+                if model_id is not None:
+                    idx = sum(ord(ch) for ch in name)
+                    await q.execute(
+                        "UPDATE phone_settings SET device = ?, sens = COALESCE(sens, ?), "
+                        "scope_sens = COALESCE(scope_sens, ?), gyro_mode = COALESCE(gyro_mode, ?), "
+                        "gyro_sens = COALESCE(gyro_sens, ?), gyro_scope_sens = COALESCE(gyro_scope_sens, ?), "
+                        "profile_id = COALESCE(profile_id, ?) WHERE model_id = ?",
+                        name, str(1.0 + (idx % 31) / 10), str(0.8 + (idx % 19) / 10),
+                        GYRO_MODES[idx % len(GYRO_MODES)], str(1.1 + (idx % 27) / 10),
+                        str(0.9 + (idx % 23) / 10), f"AND-{idx:04d}", model_id)
+        await q.execute("INSERT INTO meta (name, value) VALUES ('models_seeded', '1') "
+                        "ON CONFLICT (name) DO NOTHING")
+        log.info("Telefon modellari va PC profillari tekshirildi/yangilandi")
 
     # ========================================================================
     # FOYDALANUVCHILAR
