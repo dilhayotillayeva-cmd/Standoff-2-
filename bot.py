@@ -318,8 +318,6 @@ def render_settings(model: dict, show_kt: bool, admin: bool = False) -> str:
         value = model.get(col)
         tag = " (KT)" if (admin and kt_only) else ""
         lines.append(f"<b>{label}{tag}:</b> {esc(value) if value else '—'}")
-    if not show_kt:
-        lines += ["", "ℹ️ <i>KT CREATOR tarifida qo'shimcha maydonlar (ACCELERATOR, KICHIK USHLAGICH) ko'rinadi.</i>"]
     return "\n".join(lines)
 
 
@@ -478,21 +476,47 @@ async def cb_model(cb: CallbackQuery, db: Database, user: dict):
     model = await db.get_model(model_id) if model_id is not None else None
     if model is None:
         return await cb.answer("Model topilmadi (o'chirilgan bo'lishi mumkin).", show_alert=True)
+    # PLAYER tarifidagi Android model sozlamasini ko'rish 10 tanga turadi.
+    # PREMIUM va KT CREATOR tariflari bepul; balans yetmasa sozlama ochilmaydi.
+    if user["tariff"] == "PLAYER":
+        try:
+            await db.adjust_coins(user["tg_id"], -10, cb.from_user.id)
+        except BotError:
+            fresh = await db.get_user(cb.from_user.id)
+            balance = fresh["balance"] if fresh else 0
+            return await cb.answer(
+                f"Tanga yetarli emas! Kerak: 10 🪙. Balansingiz: {balance} 🪙",
+                show_alert=True,
+            )
     text = render_settings(model, show_kt=tariff_info(user["tariff"])["kt"])
+    if user["tariff"] == "PLAYER":
+        text += "\n\n🪙 Sozlama narxi: 10 tanga"
     await show(cb, text, ikb([btn("⬅️ Modellar", f"st:b:{model['brand']}:0")]))
     await cb.answer()
 
 
 # ---------- PC ----------
-async def send_pc_menu(event, db: Database, user: dict, with_back: bool) -> None:
+async def send_pc_menu(event, db: Database, user: dict, with_back: bool, page: int = 0) -> None:
     if not tariff_info(user["tariff"])["pc"]:
         await show(event, PC_LOCKED, kb_contact())
         return
     sections = await db.list_pc_sections()
-    rows = [[btn(f"{s['num']}. {s['title']}", f"st:pcs:{s['num']}")] for s in sections]
+    page_size = 10
+    page_count = max(1, (len(sections) + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+    visible = sections[page * page_size:(page + 1) * page_size]
+    rows = [[btn(f"{s['num']}. {s['title']}", f"st:pcs:{s['num']}")] for s in visible]
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️ Oldingi", f"st:pcpage:{page - 1}"))
+    if page < page_count - 1:
+        nav.append(btn("Keyingi ➡️", f"st:pcpage:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([btn(f"📄 {page + 1}/{page_count}-qism", "st:pcpage:noop")])
     if with_back:
         rows.append([btn("⬅️ Orqaga", "st:root")])
-    await show(event, "🖥 <b>PC NASTROYKALARI</b>\n\nBo'limni tanlang:", ikb(*rows))
+    await show(event, f"🖥 <b>PC NASTROYKALARI</b>\n\n{page + 1}-qism — {len(visible)} ta profil. Bo'limni tanlang:", ikb(*rows))
 
 
 @user_router.message(F.text == BTN_PC)
@@ -510,6 +534,15 @@ async def cb_pc(cb: CallbackQuery, db: Database, user: dict):
 @user_router.callback_query(F.data == "st:pclist")
 async def cb_pc_list(cb: CallbackQuery, db: Database, user: dict):
     await send_pc_menu(cb, db, user, with_back=False)
+    await cb.answer()
+
+@user_router.callback_query(F.data.startswith("st:pcpage:"))
+async def cb_pc_page(cb: CallbackQuery, db: Database, user: dict):
+    p = cb_parts(cb, 3)
+    if p and p[2] == "noop":
+        return await cb.answer()
+    page = to_int(p[2]) if p else 0
+    await send_pc_menu(cb, db, user, with_back=False, page=page or 0)
     await cb.answer()
 
 
