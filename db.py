@@ -44,9 +44,9 @@ SUPPORT_USERNAME = "lwox_org"
 # referral - bitta referal uchun tanga; bonus - tarifni faollashtirishdagi bir martalik bonus
 # pc - PC sozlamalariga ruxsat; kt - KT CREATOR qo'shimcha maydonlariga ruxsat
 TARIFFS = {
-    "PLAYER": {"referral": 1, "bonus": 10, "pc": True, "kt": False},
-    "PREMIUM": {"referral": 2, "bonus": 100, "pc": True, "kt": False},
-    "KT CREATOR": {"referral": 2, "bonus": 0, "pc": True, "kt": True},
+    "PLAYER": {"referral": 5, "bonus": 10, "pc": True, "kt": False},
+    "PREMIUM": {"referral": 10, "bonus": 100, "pc": True, "kt": False},
+    "KT CREATOR": {"referral": 1, "bonus": 0, "pc": True, "kt": True},
 }
 TARIFF_ORDER = tuple(TARIFFS)
 DEFAULT_TARIFF = "PLAYER"
